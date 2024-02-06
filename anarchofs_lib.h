@@ -384,6 +384,7 @@ namespace anarchofs {
 #    ifdef AFS_DAEMON_USE_FUSE
             fuse_log(FUSE_LOG_DEBUG, s, args...);
 #    else
+            printf("[%d] ", get_proc_id());
             printf(s, args...);
 #    endif
         }
@@ -708,6 +709,24 @@ namespace anarchofs {
             return open_files_cache;
         }
 
+        struct FromAndFileId {
+            int from;
+            FileId file_id;
+
+            bool operator==(const FromAndFileId &f) const {
+                return from == f.from && file_id == f.file_id;
+            }
+        };
+
+        // Hash function for FromAndFileId
+        struct HashForFromAndFileId {
+            std::size_t operator()(const FromAndFileId &s) const noexcept {
+                std::size_t h1 = std::hash<int>{}(s.from);
+                std::size_t h2 = std::hash<FileId>{}(s.file_id);
+                return h1 ^ (h2 << 1);
+            }
+        };
+
         struct LocalOpenedFiles {
             /// From path to file handler
             /// From path to counts
@@ -723,12 +742,13 @@ namespace anarchofs {
                 std::string path;
                 std::FILE *f;
             };
-            std::unordered_map<FileId, PathAndHandler> from_file_id_to_path_and_handler;
+            std::unordered_map<FromAndFileId, PathAndHandler, HashForFromAndFileId>
+                from_file_id_to_path_and_handler;
 
             LocalOpenedFiles()
                 : from_path_to_handler_and_count(16), from_file_id_to_path_and_handler(16) {}
 
-            std::FILE *open(const char *path, const FileId &file_id) {
+            std::FILE *open(const char *path, const FromAndFileId &file_id) {
                 std::string path_s(path);
                 std::FILE *f;
                 if (from_path_to_handler_and_count.count(path) == 0) {
@@ -744,12 +764,12 @@ namespace anarchofs {
                 return f;
             }
 
-            std::FILE *get_file_handler(const FileId &file_id) {
+            std::FILE *get_file_handler(const FromAndFileId &file_id) {
                 if (from_file_id_to_path_and_handler.count(file_id) == 0) return NULL;
                 return from_file_id_to_path_and_handler.at(file_id).f;
             }
 
-            bool close(const FileId &file_id) {
+            bool close(const FromAndFileId &file_id) {
                 if (from_file_id_to_path_and_handler.count(file_id) == 0) return false;
                 auto path_and_handler = from_file_id_to_path_and_handler.at(file_id);
                 auto handler_and_count = from_path_to_handler_and_count.at(path_and_handler.path);
@@ -836,7 +856,8 @@ namespace anarchofs {
                 std::string response(sizeof(RequestNum) + sizeof(Offset), 0);
                 set_request_num(request_num, &response[0]);
 
-                std::FILE *f = get_local_opened_files().open(path_hack.c_str(), file_id);
+                std::FILE *f =
+                    get_local_opened_files().open(path_hack.c_str(), FromAndFileId{rank, file_id});
                 Offset file_size_plus_one = 0;
                 if (f != NULL) file_size_plus_one = get_file_size(f) + 1;
                 write_as_chars(file_size_plus_one, &response[sizeof(RequestNum)]);
@@ -1003,7 +1024,10 @@ namespace anarchofs {
                 std::string response(sizeof(RequestNum) + local_size, 0);
                 set_request_num(request_num, &response[0]);
 
-                std::FILE *f = get_local_opened_files().get_file_handler(file_id);
+                std::FILE *f =
+                    get_local_opened_files().get_file_handler(FromAndFileId{rank, file_id});
+                if (f == NULL)
+                    throw std::runtime_error("response_read_request: file_id is not a valid");
                 Offset count = 0;
                 if (std::fseek(f, local_offset, SEEK_SET) == 0) {
                     count = std::fread(&response[sizeof(RequestNum)], 1, local_size, f);
@@ -1176,7 +1200,8 @@ namespace anarchofs {
                 FileId file_id = read_from_chars<FileId>(buffer.data() + sizeof(RequestNum));
                 log("mpi close (request) id: %d\n", (int)file_id);
 
-                get_local_opened_files().close(file_id);
+                if (!get_local_opened_files().close(FromAndFileId{rank, file_id}))
+                    throw std::runtime_error("response_close_request: invalid file_id");
             }
         }
     }
@@ -1267,10 +1292,11 @@ namespace anarchofs {
             try {
                 log("mpi thread is active, baby!\n");
                 // Initialize MPI
-                int provided = 0;
-                check_mpi(MPI_Init_thread(argc, argv, MPI_THREAD_FUNNELED, &provided));
-                if (provided < MPI_THREAD_FUNNELED)
-                    throw std::runtime_error("MPI does not support the required thread level");
+                //int provided = 0;
+                //check_mpi(MPI_Init_thread(argc, argv, MPI_THREAD_FUNNELED, &provided));
+                //if (provided < MPI_THREAD_FUNNELED)
+                //    throw std::runtime_error("MPI does not support the required thread level");
+                check_mpi(MPI_Init(argc, argv));
                 is_mpi_initialized() = true;
                 mpi_is_active = true;
 
@@ -1389,8 +1415,7 @@ namespace anarchofs {
             is_mpi_initialized() = false;
             get_finalize_mpi_thread() = false;
             get_mpi_thread() = std::thread([=]() { mpi_loop(argc, argv); });
-            while (!is_mpi_initialized())
-                ;
+            while (!is_mpi_initialized()) std::this_thread::yield();
             return true;
         } catch (const std::exception &e) {
             log("Error happened in `anarchofs::start_mpi_loop`: %s\n", e.what());
@@ -1544,6 +1569,7 @@ namespace anarchofs {
 
                     // Copy the socket path
                     const char *socket_path = get_socket_path();
+                    anarchofs::detail::log("server listening to socket %s\n", socket_path);
                     if (strnlen(socket_path, sizeof(addr.sun_path)) >= sizeof(addr.sun_path))
                         throw std::runtime_error("socket path is too long");
                     strcpy(addr.sun_path, socket_path);
@@ -1641,8 +1667,7 @@ namespace anarchofs {
                     is_socket_initialized() = false;
                     get_finalize_socket_thread() = false;
                     get_socket_thread() = std::thread([=]() { socket_loop(); });
-                    while (!is_socket_initialized())
-                        ;
+                    while (!is_socket_initialized()) std::this_thread::yield();
                 } else {
                     socket_loop();
                 }
@@ -1681,6 +1706,7 @@ namespace anarchofs {
 
                 // Copy the socket path
                 const char *socket_path = server::detail::get_socket_path();
+                anarchofs::detail::log("client accessing socket %s\n", socket_path);
                 if (strnlen(socket_path, sizeof(addr.sun_path)) >= sizeof(addr.sun_path))
                     throw std::runtime_error("socket path is too long");
                 strcpy(addr.sun_path, socket_path);

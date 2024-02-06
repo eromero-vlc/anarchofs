@@ -50,7 +50,7 @@ run_fuse_test: prepare_fuse_test_dirs
 run_socket_test:
 	rm -rf v0 v1
 	mkdir v0 v1
-	nohup mpirun -np 1 -x AFS_SOCKET=/tmp/afs0.sock ./anarchofs : -np 1 -x AFS_SOCKET=/tmp/afs1.sock ./anarchofs &> afs.out &
+	nohup mpirun -np 1 -x AFS_SOCKET=/tmp/afs0.sock ./anarchofs : -np 1 -x AFS_SOCKET=/tmp/afs1.sock ./anarchofs < /dev/null > afs.out &
 	sleep 5
 	mpirun -np 1 -x AFS_SOCKET=/tmp/afs0.sock ./test_socket v@NPROC : -np 1 -x AFS_SOCKET=/tmp/afs1.sock ./test_socket v@NPROC
 	killall anarchofs
