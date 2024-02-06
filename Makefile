@@ -1,17 +1,23 @@
-CXXFLAGS ?= -Wall -O3 $(shell pkg-config fuse3 --cflags )
-#CXXFLAGS ?= -Wall -Wextra -g3 -O0 -DANARCOFS_LOG $(shell pkg-config fuse3 --cflags ) # for debug
-LIBS ?= $(shell pkg-config fuse3 --libs )
+#CXXFLAGS ?= -Wall -Wextra -O0 -g -std=c++11 -DANARCOFS_LOG
+CXXFLAGS ?= -Wall -O3
+ifeq ($(AFS_WITH_FUSE), yes)
+  CXXFLAGS_FUSE ?= $(shell pkg-config fuse3 --cflags ) -DAFS_DAEMON_USE_FUSE
+  LIBS_FUSE ?= $(shell pkg-config fuse3 --libs )
+endif
 
-anarchofs: anarchofs.cc anarchofs_lib.h
-	${CXX} ${CXXFLAGS} anarchofs.cc ${LIBS} -o anarchofs
+anarchofs: anarchofs.cc anarchofs_lib.h Makefile
+	${CXX} ${CXXFLAGS} ${CXXFLAGS_FUSE} anarchofs.cc ${LIBS_FUSE} -o anarchofs
+
+test_socket: test_socket.cc anarchofs_lib.h Makefile
+	${CXX} ${CXXFLAGS} test_socket.cc -o test_socket
 
 clean:
-	rm -f anarchofs
+	rm -f anarchofs test_socket
 
 format:
-	clang-format -i anarchofs.cc anarchofs_lib.h
+	clang-format -i anarchofs.cc anarchofs_lib.h test_socket.cc
 
-prepare_test_dirs: unmount_test
+prepare_fuse_test_dirs: unmount_test
 	rm -rf t0 t1 tref
 	mkdir t0
 	seq 1 10 > t0/f0
@@ -30,10 +36,10 @@ unmount_test:
 	-pkill -9 anarchofs &> /dev/null
 	-mpirun -q -np 1 fusermount3 -u v0 : -np 1 fusermount3 -u v1 &> /dev/null
 
-TEST_OPTIONS ?= -s -f -o max_threads=1
 #TEST_OPTIONS ?= -s -d -o max_threads=1
+TEST_OPTIONS ?= -s -f -o max_threads=1
 
-run_test: prepare_test_dirs
+run_fuse_test: prepare_fuse_test_dirs
 	mpirun -np 1 ./anarchofs ${TEST_OPTIONS} -o modules=subdir -o subdir=${PWD}/t@NPROC ./v0 : -np 1 ./anarchofs ${TEST_OPTIONS} -o modules=subdir -o subdir=${PWD}/t@NPROC ./v1 & \
 	sleep 1; \
 	for d in v0 v1; do \
@@ -42,3 +48,11 @@ run_test: prepare_test_dirs
 		done; \
 	done || true
 	mpirun -np 1 fusermount3 -u v0 : -np 1 fusermount3 -u v1
+
+run_socket_test:
+	rm -rf v0 v1
+	mkdir v0 v1
+	nohup mpirun -np 1 -x AFS_SOCKET=/tmp/afs0.sock ./anarchofs : -np 1 -x AFS_SOCKET=/tmp/afs1.sock ./anarchofs < /dev/null > afs.out &
+	sleep 5
+	mpirun -np 1 -x AFS_SOCKET=/tmp/afs0.sock ./test_socket v@NPROC : -np 1 -x AFS_SOCKET=/tmp/afs1.sock ./test_socket v@NPROC
+	killall anarchofs
