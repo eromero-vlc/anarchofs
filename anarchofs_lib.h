@@ -736,7 +736,9 @@ namespace anarchofs {
                     if (f == NULL) return NULL;
                     from_path_to_handler_and_count[path_s] = {f, 1};
                 } else {
-                    f = from_path_to_handler_and_count[path_s].f;
+                    auto &handler_and_count = from_path_to_handler_and_count[path_s];
+                    f = handler_and_count.f;
+                    handler_and_count.count++;
                 }
                 from_file_id_to_path_and_handler[file_id] = {path_s, f};
                 return f;
@@ -766,16 +768,21 @@ namespace anarchofs {
 
         struct TickingCallback {
             /// Actual callback to execute
-            std::function<void()> callback;
+            std::shared_ptr<std::function<void()>> callback;
 
-            /// Remaining number of calls before executing the callback
-            mutable unsigned int ticks_before_calling;
+            TickingCallback() {}
+
+            TickingCallback(const std::function<void()> &callback)
+                : callback(std::make_shared<std::function<void()>>(callback)) {}
 
             /// Attempt to execute the callback
             void call() {
-                if (ticks_before_calling == 0)
-                    throw std::runtime_error("too many calls to this ticking call");
-                if (--ticks_before_calling == 0) callback();
+                // If there is only one reference, queue the callback
+                if (callback.use_count() == 1) {
+                    std::function<void()> f = *callback;
+                    get_func_buffer().push_back([=]() { f(); });
+                }
+                callback.reset();
             }
         };
 
@@ -787,7 +794,7 @@ namespace anarchofs {
         namespace detail_open_file {
             struct SizeAndCallback {
                 std::size_t size;
-                std::shared_ptr<TickingCallback> callback;
+                TickingCallback callback;
             };
 
             /// Get open file pending transactions
@@ -823,7 +830,8 @@ namespace anarchofs {
                 const char *path = buffer.data() + sizeof(RequestNum) + sizeof(FileId);
                 buffer[message_size] = 0; // make path a null-terminate string
                 std::string path_hack = replace_hack(path);
-                log("getting requesting get_open_file from %d: %s\n", rank, path_hack.c_str());
+                log("mpi open id: %d process response from: %d: file: %s\n", (int)file_id, rank,
+                    path_hack.c_str());
 
                 std::string response(sizeof(RequestNum) + sizeof(Offset), 0);
                 set_request_num(request_num, &response[0]);
@@ -852,7 +860,7 @@ namespace anarchofs {
                 Offset file_size_plus_one = read_from_chars<Offset>(msg_it);
                 auto &size_and_callback = get_open_file_pending_transactions().at(request_num);
                 size_and_callback.size = file_size_plus_one;
-                size_and_callback.callback->call();
+                size_and_callback.callback.call();
             }
         }
     }
@@ -874,7 +882,7 @@ namespace anarchofs {
         if (next_file_id == no_file_id) next_file_id++;
         FileId file_id = next_file_id++;
 
-        log("get get_open_file request for file %s : file_id %d\n", path, (int)file_id);
+        log("open id: %d (starting) file: %s\n", (int)file_id, path);
 
         // Mark the requests from this node
         // Queue the requests
@@ -883,14 +891,13 @@ namespace anarchofs {
         write_as_chars(file_id, &msg_pattern[sizeof(RequestNum)]);
         const auto sender = [=](std::function<void()> process) {
             // Prepare the responses
-            std::shared_ptr<TickingCallback> callback =
-                std::make_shared<TickingCallback>(TickingCallback{process, get_num_procs()});
+            TickingCallback callback(process);
             for (unsigned int rank = 0; rank < get_num_procs(); ++rank)
                 get_open_file_pending_transactions().emplace(
                     std::make_pair(first_req + rank, SizeAndCallback{0, callback}));
 
             // Send the requests
-            log("send get_open_file requests %d\n", file_id);
+            //log("send get_open_file requests %d\n", file_id);
             auto &pending_requests = get_pending_mpi_requests();
             for (unsigned int rank = 0; rank < get_num_procs(); ++rank) {
                 std::string this_msg_pattern = msg_pattern;
@@ -906,7 +913,7 @@ namespace anarchofs {
 
         // Process responses
         const auto process = [=]() {
-            log("process get_open_file requests for file_id %d\n", (int)file_id);
+            log("mpi open id: %d (process)\n", (int)file_id);
 
             std::vector<Offset> file_sizes(get_num_procs());
             bool file_exists = false;
@@ -923,7 +930,7 @@ namespace anarchofs {
 
             // Return special code if the file does not exists
             if (!file_exists) {
-                log("get_open_file request for file_id %d does not exist\n", (int)file_id);
+                log("open request for file_id %d does not exist\n", (int)file_id);
                 response_callback(no_file_id);
                 return;
             }
@@ -967,7 +974,7 @@ namespace anarchofs {
                 char *buffer;
                 std::size_t size;
                 std::size_t count;
-                std::shared_ptr<TickingCallback> callback;
+                TickingCallback callback;
             };
 
             /// Get read pending transactions
@@ -990,8 +997,8 @@ namespace anarchofs {
                     read_from_chars<Offset>(buffer.data() + sizeof(RequestNum) + sizeof(FileId));
                 Offset local_size = read_from_chars<Offset>(buffer.data() + sizeof(RequestNum) +
                                                             sizeof(FileId) + sizeof(Offset));
-                log("getting requesting read from file id %d %d of characters from %d\n",
-                    (int)file_id, (int)local_size, (int)local_offset);
+                log("mpi read request: %d id: %d from: %d size: %d\n", (int)request_num,
+                    (int)file_id, (int)local_offset, (int)local_size);
 
                 std::string response(sizeof(RequestNum) + local_size, 0);
                 set_request_num(request_num, &response[0]);
@@ -1022,7 +1029,7 @@ namespace anarchofs {
                 auto &v = get_read_pending_transactions().at(request_num);
                 std::copy_n(msg_it, count, v.buffer);
                 v.count = count;
-                v.callback->call();
+                v.callback.call();
             }
         }
     }
@@ -1039,9 +1046,6 @@ namespace anarchofs {
         using namespace detail;
         using namespace detail_read;
 
-        log("read from file_id %d %d characters starting from %d\n", (int)file_id, (int)count,
-            (int)offset);
-
         // Quick answer if the count is zero
         if (count == 0) {
             response_callback(0);
@@ -1052,6 +1056,9 @@ namespace anarchofs {
         static RequestNum next_req = 0;
         RequestNum first_req = next_req;
         next_req += get_num_procs();
+
+        log("mpi read (starting) request: %d id: %d from: %d size: %d\n", (int)first_req,
+            (int)file_id, (int)offset, (int)count);
 
         // Queue the requests
         auto send = [=](const std::function<void()> &process) {
@@ -1078,15 +1085,15 @@ namespace anarchofs {
                     num_requests++;
                 }
             }
-            std::shared_ptr<TickingCallback> callback =
-                std::make_shared<TickingCallback>(TickingCallback{process, get_num_procs()});
+            TickingCallback callback(process);
             for (unsigned int rank = 0; rank < get_num_procs(); ++rank)
                 if (local_counts[rank] > 0)
-                    get_read_pending_transactions()[first_req + rank] = StringSizeCountCallback{
-                        buffer + str_offsets[rank], local_counts[rank], Offset(0), callback};
+                    get_read_pending_transactions().emplace(std::make_pair(
+                        first_req + rank,
+                        StringSizeCountCallback{buffer + str_offsets[rank], local_counts[rank],
+                                                Offset(0), callback}));
 
-            log("send read from file_id %d %d characters starting from %d\n", (int)file_id,
-                (int)count, (int)offset);
+            //log("mpi read (send) request: %d\n", (int)first_req);
             auto &pending_requests = get_pending_mpi_requests();
             for (unsigned int rank = 0; rank < get_num_procs(); ++rank) {
                 if (local_counts[rank] == 0) continue;
@@ -1110,6 +1117,8 @@ namespace anarchofs {
 
         // Process responses
         const auto process = [=]() {
+            log("mpi read (process) request: %d\n", (int)first_req);
+
             bool incomplete_request = false;
             std::int64_t res = 0;
             auto &pending_transactions = get_read_pending_transactions();
@@ -1165,7 +1174,7 @@ namespace anarchofs {
                 RequestNum request_num = get_request_num(buffer.data());
                 (void)request_num;
                 FileId file_id = read_from_chars<FileId>(buffer.data() + sizeof(RequestNum));
-                log("getting requesting close from file id %d\n", (int)file_id);
+                log("mpi close (request) id: %d\n", (int)file_id);
 
                 get_local_opened_files().close(file_id);
             }
@@ -1180,7 +1189,7 @@ namespace anarchofs {
         using namespace detail;
         using namespace detail_close;
 
-        log("close file_id %d\n", file_id);
+        log("mpi close id: %d\n", file_id);
 
         // Mark the requests from this node
         static RequestNum next_req = 0;
@@ -1189,7 +1198,7 @@ namespace anarchofs {
 
         // Queue the requests
         get_func_buffer().push_back([=]() {
-            log("send close requests for file id %d\n", file_id);
+            //log("send close requests for file id %d\n", file_id);
 
             // Quick answer if the file_id does not exists
             if (get_open_files_cache().count(file_id) == 0) {
@@ -1455,15 +1464,14 @@ namespace anarchofs {
                 const char *msg = buffer + sizeof(std::uint32_t);
                 switch (action) {
                 case Action::GlobalOpenRequest: {
-                    log("get_open_file request socket: %d\n", socket);
-
                     // Get path
                     std::string path(msg, msg + message_size);
 
+                    log("socket open socket: %d path: %s\n", socket, path.c_str());
+
                     // Open file
                     get_open_file(path.c_str(), [=](FileId file_id) {
-                        log("get_open_file request socket: %d returning: %d\n", socket,
-                            (int)file_id);
+                        log("socket open socket: %d returning: %d\n", socket, (int)file_id);
                         // Return back the file id
                         write(socket, (const void *)&file_id, sizeof(FileId));
                     });
@@ -1493,8 +1501,13 @@ namespace anarchofs {
                 case Action::CloseRequest: {
                     // Read file id
                     FileId file_id = read_from_chars<FileId>(msg);
+
+                    log("socket close socket: %d id: %d\n", socket, (int)file_id);
+
                     // Close the file
                     close(file_id, [=](bool success) {
+                        log("socket close socket: %d id: %d returning: %d\n", socket, (int)file_id,
+                            success ? 0 : 1);
                         // Return back whether the action was successful
                         std::uint32_t r = (success ? 0 : 1);
                         write(socket, (const void *)&r, sizeof(r));
