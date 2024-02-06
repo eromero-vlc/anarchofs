@@ -1,3 +1,8 @@
+/// AnarchoFS daemon
+
+#include "anarchofs_lib.h"
+
+#ifdef AFS_DAEMON_USE_FUSE
 /// AnarchoFS implementation with FUSE.
 ///
 /// This code is based on example/passthrough.c in libfuse, https://github.com/libfuse/libfuse.
@@ -5,22 +10,21 @@
 ///   Copyright (C) 2001-2007  Miklos Szeredi <miklos@szeredi.hu>
 ///   Copyright (C) 2011       Sebastian Pipping <sebastian@pipping.org>
 
-#define FUSE_USE_VERSION 31
+#    define FUSE_USE_VERSION 31
 
-#include "anarchofs_lib.h"
-#include <dirent.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <fuse.h>
-#include <stdio.h>
-#include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#ifdef __FreeBSD__
-#    include <sys/socket.h>
-#    include <sys/un.h>
-#endif
-#include <sys/time.h>
+#    include <dirent.h>
+#    include <errno.h>
+#    include <fcntl.h>
+#    include <fuse.h>
+#    include <stdio.h>
+#    include <string.h>
+#    include <sys/stat.h>
+#    include <unistd.h>
+#    ifdef __FreeBSD__
+#        include <sys/socket.h>
+#        include <sys/un.h>
+#    endif
+#    include <sys/time.h>
 
 static int fill_dir_plus = 0;
 
@@ -171,13 +175,22 @@ static const struct fuse_operations xmp_oper = {
     .destroy = xmp_destroy,
     .access = xmp_access,
 };
+#endif // AFS_DAEMON_USE_FUSE
 
 int main(int argc, char *argv[]) {
+#ifdef AFS_DAEMON_USE_FUSE
     umask(0);
+#endif
     if (!anarchofs::start_mpi_loop(&argc, &argv)) {
         printf("something when wrong!\n");
         return -1;
     }
+#ifdef AFS_DAEMON_USE_FUSE
+    anarchofs::server::start_socket_loop();
     int r = fuse_main(argc, argv, &xmp_oper, NULL);
     return r;
+#else
+    anarchofs::server::start_socket_loop(false /* launch another thread */);
+    return 0;
+#endif
 }
