@@ -54,6 +54,7 @@
 #include <dirent.h>
 #include <functional>
 #ifdef AFS_DAEMON_USE_FUSE
+#    define FUSE_USE_VERSION 31
 #    include <fuse.h>
 #endif
 #include <memory>
@@ -1498,7 +1499,9 @@ namespace anarchofs {
                     get_open_file(path.c_str(), [=](FileId file_id) {
                         log("socket open socket: %d returning: %d\n", socket, (int)file_id);
                         // Return back the file id
-                        write(socket, (const void *)&file_id, sizeof(FileId));
+                        if (write(socket, (const void *)&file_id, sizeof(FileId)) != sizeof(FileId))
+                            throw std::runtime_error(
+                                "process_socket_action: error writing on socket");
                     });
                     break;
                 }
@@ -1517,8 +1520,12 @@ namespace anarchofs {
                          [=](std::int64_t size_or_error) {
                              // Return the read size or an error code together with read content
                              write_as_chars(size_or_error, read_buffer->data());
-                             write(socket, read_buffer->data(),
-                                   sizeof(std::int64_t) + (size_or_error < 0 ? 0 : size_or_error));
+                             ssize_t chars_to_write =
+                                 sizeof(std::int64_t) + (size_or_error < 0 ? 0 : size_or_error);
+                             if (write(socket, read_buffer->data(), chars_to_write) !=
+                                 chars_to_write)
+                                 throw std::runtime_error(
+                                     "process_socket_action: error writing on socket");
                          });
                     break;
                 }
@@ -1535,7 +1542,9 @@ namespace anarchofs {
                             success ? 0 : 1);
                         // Return back whether the action was successful
                         std::uint32_t r = (success ? 0 : 1);
-                        write(socket, (const void *)&r, sizeof(r));
+                        if (write(socket, (const void *)&r, sizeof(r)) != sizeof(r))
+                            throw std::runtime_error(
+                                "process_socket_action: error writing on socket");
                     });
                     break;
                 }
@@ -1699,36 +1708,44 @@ namespace anarchofs {
 
     namespace client {
 
-        inline int get_socket() {
-            static int socket = [=]() {
-                struct sockaddr_un addr;
-                memset(&addr, 0, sizeof(struct sockaddr_un));
+        namespace detail {
+            inline int get_socket() {
+                static int socket = [=]() {
+                    struct sockaddr_un addr;
+                    memset(&addr, 0, sizeof(struct sockaddr_un));
 
-                // Copy the socket path
-                const char *socket_path = server::detail::get_socket_path();
-                anarchofs::detail::log("client accessing socket %s\n", socket_path);
-                if (strnlen(socket_path, sizeof(addr.sun_path)) >= sizeof(addr.sun_path))
-                    throw std::runtime_error("socket path is too long");
-                strcpy(addr.sun_path, socket_path);
+                    // Copy the socket path
+                    const char *socket_path = server::detail::get_socket_path();
+                    anarchofs::detail::log("client accessing socket %s\n", socket_path);
+                    if (strnlen(socket_path, sizeof(addr.sun_path)) >= sizeof(addr.sun_path))
+                        throw std::runtime_error("socket path is too long");
+                    strcpy(addr.sun_path, socket_path);
 
-                // Create the socket
-                int socket_fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
-                if (socket_fd == -1) throw std::runtime_error("could not create socket");
+                    // Create the socket
+                    int socket_fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+                    if (socket_fd == -1) throw std::runtime_error("could not create socket");
 
-                addr.sun_family = AF_UNIX;
-                if (connect(socket_fd, (struct sockaddr *)&addr, sizeof(struct sockaddr_un)) == -1)
-                    throw std::runtime_error("could not bind socket");
+                    addr.sun_family = AF_UNIX;
+                    if (connect(socket_fd, (struct sockaddr *)&addr, sizeof(struct sockaddr_un)) ==
+                        -1)
+                        throw std::runtime_error("could not bind socket");
 
-                return socket_fd;
-            }();
-            return socket;
+                    return socket_fd;
+                }();
+                return socket;
+            }
         }
 
+        /// File handler
         struct File {
             std::FILE *f;       ///< handler for local file
             FileId file_id;     ///< file id for remote file
             std::size_t offset; ///< current displacement on remote file
         };
+
+        /// Open a file (for read-only for now)
+        /// \param path: path of the file to open
+        /// \return: file handler or (null if failed)
 
         inline File *open(const char *filename) {
             using namespace anarchofs::detail;
@@ -1748,11 +1765,12 @@ namespace anarchofs {
             std::vector<char> buffer(sizeof(uint32_t) + filename_size);
             write_as_chars((std::uint32_t)server::detail::Action::GlobalOpenRequest, buffer.data());
             std::copy_n(filename, filename_size, buffer.data() + sizeof(uint32_t));
-            if (write(get_socket(), buffer.data(), buffer.size()) != (ssize_t)buffer.size())
+            if (write(detail::get_socket(), buffer.data(), buffer.size()) != (ssize_t)buffer.size())
                 throw std::runtime_error("error writing to socket");
 
             std::vector<char> buffer_response(sizeof(FileId));
-            if (::read(get_socket(), buffer_response.data(), sizeof(FileId)) != sizeof(FileId))
+            if (::read(detail::get_socket(), buffer_response.data(), sizeof(FileId)) !=
+                sizeof(FileId))
                 throw std::runtime_error("error reading from socket");
             FileId file_id = read_from_chars<FileId>(buffer_response.data());
             if (file_id > 0)
@@ -1761,12 +1779,22 @@ namespace anarchofs {
                 return nullptr;
         }
 
+        /// Change the current cursor of the file handler
+        /// \param f: file handler
+        /// \param offset: absolute offset of the first element to be read
+
         inline void seek(File *f, std::size_t offset) {
             if (f->f)
                 fseek(f->f, offset, SEEK_SET);
             else
                 f->offset = offset;
         }
+
+        /// Write the content of the file into a given buffer
+        /// \param f: file handler
+        /// \param v: buffer where to write the content
+        /// \param n: number of characters to read
+        /// \return: number of characters written into the buffer if positive; error code otherwise
 
         inline std::int64_t read(File *f, char *v, std::size_t n) {
             using namespace anarchofs::detail;
@@ -1782,12 +1810,12 @@ namespace anarchofs {
                            buffer.data() + sizeof(std::uint32_t) + sizeof(FileId));
             write_as_chars((std::size_t)n, buffer.data() + sizeof(std::uint32_t) + sizeof(FileId) +
                                                sizeof(std::size_t));
-            if (write(get_socket(), buffer.data(), buffer.size()) != (ssize_t)buffer.size())
+            if (write(detail::get_socket(), buffer.data(), buffer.size()) != (ssize_t)buffer.size())
                 throw std::runtime_error("error writing to socket");
 
             std::vector<char> buffer_response(sizeof(std::int64_t) + n);
             std::size_t response_size =
-                ::read(get_socket(), buffer_response.data(), buffer_response.size());
+                ::read(detail::get_socket(), buffer_response.data(), buffer_response.size());
             if (response_size < sizeof(std::int64_t))
                 throw std::runtime_error("error reading from socket");
             std::int64_t error_or_size = read_from_chars<std::int64_t>(buffer_response.data());
@@ -1799,6 +1827,10 @@ namespace anarchofs {
 
             return error_or_size;
         }
+
+        /// Close a file hander
+        /// \param f: file handler
+        /// \return: whether the operation was successful
 
         inline bool close(File *f) {
             using namespace anarchofs::detail;
@@ -1814,11 +1846,12 @@ namespace anarchofs {
             std::vector<char> buffer(sizeof(uint32_t) + sizeof(FileId));
             write_as_chars((std::uint32_t)server::detail::Action::CloseRequest, buffer.data());
             write_as_chars(f->file_id, buffer.data() + sizeof(std::uint32_t));
-            if (write(get_socket(), buffer.data(), buffer.size()) != (ssize_t)buffer.size())
+            if (write(detail::get_socket(), buffer.data(), buffer.size()) != (ssize_t)buffer.size())
                 throw std::runtime_error("error writing to socket");
 
             std::uint32_t response = 0;
-            if (::read(get_socket(), (void *)&response, sizeof(response)) != sizeof(response))
+            if (::read(detail::get_socket(), (void *)&response, sizeof(response)) !=
+                sizeof(response))
                 throw std::runtime_error("error reading from socket");
             delete f;
             return response == 0;

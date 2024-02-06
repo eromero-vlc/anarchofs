@@ -32,9 +32,18 @@ void check_file(const char *base_path, int id) {
     auto f = anarchofs::client::open(filename.c_str());
     if (f == nullptr) throw std::runtime_error("error remote reading the file");
     std::vector<int> data(100);
+
     anarchofs::client::read(f, (char *)data.data(), data.size() * sizeof(int));
     for (std::size_t i = 0; i < data.size(); ++i)
         if ((std::size_t)data[i] != id + i) throw std::runtime_error("check didn't pass");
+
+    anarchofs::client::seek(f, 0);
+    for (std::size_t i = 0; i < data.size(); ++i) {
+        int d;
+        anarchofs::client::read(f, (char *)&d, sizeof(int));
+        if ((std::size_t)d != id + i) throw std::runtime_error("check didn't pass");
+    }
+
     anarchofs::client::close(f);
 }
 

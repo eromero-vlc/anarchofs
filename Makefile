@@ -1,16 +1,18 @@
-CXXFLAGS ?= -Wall -Wextra -O0 -g -std=c++11 -DANARCOFS_LOG
-CXXFLAGS ?= -Wall -O3 $(shell pkg-config fuse3 --cflags ) -DAFS_DAEMON_USE_FUSE
-#CXXFLAGS ?= -Wall -Wextra -g3 -O0 -DANARCOFS_LOG $(shell pkg-config fuse3 --cflags ) # for debug
-LIBS ?= $(shell pkg-config fuse3 --libs )
+#CXXFLAGS ?= -Wall -Wextra -O0 -g -std=c++11 -DANARCOFS_LOG
+CXXFLAGS ?= -Wall -O3
+ifeq ($(AFS_WITH_FUSE), yes)
+  CXXFLAGS_FUSE ?= $(shell pkg-config fuse3 --cflags ) -DAFS_DAEMON_USE_FUSE
+  LIBS_FUSE ?= $(shell pkg-config fuse3 --libs )
+endif
 
 anarchofs: anarchofs.cc anarchofs_lib.h Makefile
-	${CXX} ${CXXFLAGS} anarchofs.cc ${LIBS} -o anarchofs
+	${CXX} ${CXXFLAGS} ${CXXFLAGS_FUSE} anarchofs.cc ${LIBS_FUSE} -o anarchofs
 
 test_socket: test_socket.cc anarchofs_lib.h Makefile
 	${CXX} ${CXXFLAGS} test_socket.cc -o test_socket
 
 clean:
-	rm -f anarchofs
+	rm -f anarchofs test_socket
 
 format:
 	clang-format -i anarchofs.cc anarchofs_lib.h test_socket.cc
@@ -34,8 +36,8 @@ unmount_test:
 	-pkill -9 anarchofs &> /dev/null
 	-mpirun -q -np 1 fusermount3 -u v0 : -np 1 fusermount3 -u v1 &> /dev/null
 
-TEST_OPTIONS ?= -s -f -o max_threads=1
 #TEST_OPTIONS ?= -s -d -o max_threads=1
+TEST_OPTIONS ?= -s -f -o max_threads=1
 
 run_fuse_test: prepare_fuse_test_dirs
 	mpirun -np 1 ./anarchofs ${TEST_OPTIONS} -o modules=subdir -o subdir=${PWD}/t@NPROC ./v0 : -np 1 ./anarchofs ${TEST_OPTIONS} -o modules=subdir -o subdir=${PWD}/t@NPROC ./v1 & \

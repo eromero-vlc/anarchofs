@@ -10,8 +10,6 @@
 ///   Copyright (C) 2001-2007  Miklos Szeredi <miklos@szeredi.hu>
 ///   Copyright (C) 2011       Sebastian Pipping <sebastian@pipping.org>
 
-#    define FUSE_USE_VERSION 31
-
 #    include <dirent.h>
 #    include <errno.h>
 #    include <fcntl.h>
