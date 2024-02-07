@@ -60,6 +60,7 @@
 #include <memory>
 #include <mpi.h>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <sys/socket.h>
@@ -1481,6 +1482,27 @@ namespace anarchofs {
                 return "/tmp/anarchofs.sock";
             }
 
+            /// Return the list of opened file ids associated to a socket
+
+            inline std::unordered_map<int, std::set<FileId>> &get_opened_files_by_sockets() {
+                static std::unordered_map<int, std::set<FileId>> file_ids{16};
+                return file_ids;
+            }
+
+            /// Start tracking opened files by a socket
+
+            inline void start_tracking_files(int socket) {
+                get_opened_files_by_sockets().emplace(std::make_pair(socket, std::set<FileId>{}));
+            }
+
+            /// Close all opened files associated to a socket
+
+            inline void close_all_files(int socket) {
+                for (const auto &file_id : get_opened_files_by_sockets().at(socket))
+                    close(file_id, [=](bool) {});
+                get_opened_files_by_sockets().erase(socket);
+            }
+
             inline bool process_socket_action(int socket, const char *buffer,
                                               unsigned int message_size) {
                 using namespace anarchofs::detail;
@@ -1498,10 +1520,13 @@ namespace anarchofs {
                     // Open file
                     get_open_file(path.c_str(), [=](FileId file_id) {
                         log("socket open socket: %d returning: %d\n", socket, (int)file_id);
+
+                        // Track opened files by the socket
+                        get_opened_files_by_sockets().at(socket).insert(file_id);
+
                         // Return back the file id
                         if (write(socket, (const void *)&file_id, sizeof(FileId)) != sizeof(FileId))
-                            throw std::runtime_error(
-                                "process_socket_action: error writing on socket");
+                            log("process_socket_action: error writing on socket");
                     });
                     break;
                 }
@@ -1524,8 +1549,7 @@ namespace anarchofs {
                                  sizeof(std::int64_t) + (size_or_error < 0 ? 0 : size_or_error);
                              if (write(socket, read_buffer->data(), chars_to_write) !=
                                  chars_to_write)
-                                 throw std::runtime_error(
-                                     "process_socket_action: error writing on socket");
+                                 log("process_socket_action: error writing on socket");
                          });
                     break;
                 }
@@ -1533,6 +1557,10 @@ namespace anarchofs {
                 case Action::CloseRequest: {
                     // Read file id
                     FileId file_id = read_from_chars<FileId>(msg);
+
+                    // Track opened files by the socket
+                    if (get_opened_files_by_sockets().at(socket).count(file_id) == 1)
+                        get_opened_files_by_sockets().at(socket).erase(file_id);
 
                     log("socket close socket: %d id: %d\n", socket, (int)file_id);
 
@@ -1543,8 +1571,7 @@ namespace anarchofs {
                         // Return back whether the action was successful
                         std::uint32_t r = (success ? 0 : 1);
                         if (write(socket, (const void *)&r, sizeof(r)) != sizeof(r))
-                            throw std::runtime_error(
-                                "process_socket_action: error writing on socket");
+                            log("process_socket_action: error writing on socket");
                     });
                     break;
                 }
@@ -1603,7 +1630,7 @@ namespace anarchofs {
                     is_socket_initialized() = true;
 
                     std::vector<int> client_sockets;
-                    std::vector<char> buffer(1024);
+                    std::vector<char> buffer(sizeof(std::uint32_t) + (std::size_t)PATH_MAX);
                     while (!get_finalize_socket_thread()) {
                         fd_set readfds;
 
@@ -1643,6 +1670,9 @@ namespace anarchofs {
                                 }
                             }
                             if (!added) client_sockets.push_back(new_socket);
+
+                            // Start tracking the files opened this socket
+                            start_tracking_files(new_socket);
                         }
 
                         // Check IO operations on the other sockets
@@ -1652,8 +1682,9 @@ namespace anarchofs {
                             // Check for incoming messages, otherwise assume closing
                             int count =
                                 ::read(sd, (void *)buffer.data(), (std::size_t)buffer.size());
-                            if (count == 0 || count == 1024 ||
+                            if (count == 0 || count == (int)buffer.size() ||
                                 !process_socket_action(sd, buffer.data(), count)) {
+                                close_all_files(sd);
                                 close(sd);
                                 sd = 0;
                             }
