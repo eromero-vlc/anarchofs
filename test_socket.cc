@@ -27,8 +27,7 @@ void create_file(const char *base_path, int id) {
 }
 
 void check_file(const char *base_path, int id) {
-    auto filename =
-        std::string("afs:") + std::string(base_path) + std::string("/f") + std::to_string(id);
+    auto filename = std::string(base_path) + std::string("/f") + std::to_string(id);
     auto f = anarchofs::client::open(filename.c_str());
     if (f == nullptr) throw std::runtime_error("error remote reading the file");
     std::vector<int> data(100);

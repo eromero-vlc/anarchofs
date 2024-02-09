@@ -1769,7 +1769,6 @@ namespace anarchofs {
 
         /// File handler
         struct File {
-            std::FILE *f;       ///< handler for local file
             FileId file_id;     ///< file id for remote file
             std::size_t offset; ///< current displacement on remote file
         };
@@ -1781,17 +1780,6 @@ namespace anarchofs {
         inline File *open(const char *filename) {
             using namespace anarchofs::detail;
 
-            // Check if the file starts with afs:
-            bool is_remote = (std::strncmp("afs:", filename, 4) == 0);
-
-            // If not is remote, open as a local file
-            if (!is_remote) {
-                std::FILE *f = fopen(filename, "r");
-                if (f == NULL) return NULL;
-                return new File{f, 0, 0};
-            }
-
-            filename += 4; // skip afs:
             int filename_size = strlen(filename);
             std::vector<char> buffer(sizeof(uint32_t) + filename_size);
             write_as_chars((std::uint32_t)server::detail::Action::GlobalOpenRequest, buffer.data());
@@ -1805,7 +1793,7 @@ namespace anarchofs {
                 throw std::runtime_error("error reading from socket");
             FileId file_id = read_from_chars<FileId>(buffer_response.data());
             if (file_id > 0)
-                return new File{NULL, file_id, 0};
+                return new File{file_id, 0};
             else
                 return nullptr;
         }
@@ -1814,12 +1802,7 @@ namespace anarchofs {
         /// \param f: file handler
         /// \param offset: absolute offset of the first element to be read
 
-        inline void seek(File *f, std::size_t offset) {
-            if (f->f)
-                fseek(f->f, offset, SEEK_SET);
-            else
-                f->offset = offset;
-        }
+        inline void seek(File *f, std::size_t offset) { f->offset = offset; }
 
         /// Write the content of the file into a given buffer
         /// \param f: file handler
@@ -1829,9 +1812,6 @@ namespace anarchofs {
 
         inline std::int64_t read(File *f, char *v, std::size_t n) {
             using namespace anarchofs::detail;
-
-            // Do read for local file
-            if (f->f) { return fread(v, sizeof(char), n, f->f); }
 
             // Prepare the message
             std::vector<char> buffer(sizeof(uint32_t) + sizeof(FileId) + sizeof(std::size_t) * 2);
@@ -1865,13 +1845,6 @@ namespace anarchofs {
 
         inline bool close(File *f) {
             using namespace anarchofs::detail;
-
-            // Do close for local file
-            if (f->f) {
-                bool success = (fclose(f->f) == 0);
-                delete f;
-                return success;
-            }
 
             // Prepare the message
             std::vector<char> buffer(sizeof(uint32_t) + sizeof(FileId));
