@@ -388,10 +388,23 @@ namespace anarchofs {
 #    else
             printf("[%d] ", get_proc_id());
             printf(s, args...);
+            fflush(stdout);
+#    endif
+        }
+
+        template <typename... Args> void warning(const char *s, Args... args) {
+#    ifdef AFS_DAEMON_USE_FUSE
+            fuse_log(FUSE_LOG_DEBUG, s, args...);
+#    else
+            printf("[%d] warning: ", get_proc_id());
+            printf(s, args...);
+            fflush(stdout);
+            throw std::runtime_error("wtf");
 #    endif
         }
 #else
         template <typename... Args> void log(const char *, Args...) {}
+        template <typename... Args> void warning(const char *, Args...) {}
 #endif
     }
 
@@ -1396,7 +1409,7 @@ namespace anarchofs {
                     if (!something_done) std::this_thread::yield();
                 }
             } catch (const std::exception &e) {
-                log("Error happened in `anarchofs::mpi_loop`: %s\n", e.what());
+                warning("Error happened in `anarchofs::mpi_loop`: %s\n", e.what());
             }
 
             // Finalize MPI
@@ -1420,7 +1433,7 @@ namespace anarchofs {
             while (!is_mpi_initialized()) std::this_thread::yield();
             return true;
         } catch (const std::exception &e) {
-            log("Error happened in `anarchofs::start_mpi_loop`: %s\n", e.what());
+            warning("Error happened in `anarchofs::start_mpi_loop`: %s\n", e.what());
             return false;
         }
     }
@@ -1436,7 +1449,7 @@ namespace anarchofs {
             log("MPI loop stopped\n");
             return true;
         } catch (const std::exception &e) {
-            log("Error happened in `anarchofs::stop_mpi_loop`: %s\n", e.what());
+            warning("Error happened in `anarchofs::stop_mpi_loop`: %s\n", e.what());
             return false;
         }
     }
@@ -1526,7 +1539,7 @@ namespace anarchofs {
 
                         // Return back the file id
                         if (write(socket, (const void *)&file_id, sizeof(FileId)) != sizeof(FileId))
-                            log("process_socket_action: error writing on socket");
+                            warning("process_socket_action: error writing on socket\n");
                     });
                     break;
                 }
@@ -1547,9 +1560,12 @@ namespace anarchofs {
                              write_as_chars(size_or_error, read_buffer->data());
                              ssize_t chars_to_write =
                                  sizeof(std::int64_t) + (size_or_error < 0 ? 0 : size_or_error);
+                             if (size_or_error > (std::int64_t)size)
+                                 throw std::runtime_error(
+                                     "process_socket_action: got invalid `size_or_error`");
                              if (write(socket, read_buffer->data(), chars_to_write) !=
                                  chars_to_write)
-                                 log("process_socket_action: error writing on socket");
+                                 warning("process_socket_action: error writing on socket\n");
                          });
                     break;
                 }
@@ -1571,7 +1587,7 @@ namespace anarchofs {
                         // Return back whether the action was successful
                         std::uint32_t r = (success ? 0 : 1);
                         if (write(socket, (const void *)&r, sizeof(r)) != sizeof(r))
-                            log("process_socket_action: error writing on socket");
+                            warning("process_socket_action: error writing on socket\n");
                     });
                     break;
                 }
@@ -1680,18 +1696,18 @@ namespace anarchofs {
                             if (!FD_ISSET(sd, &readfds)) continue;
 
                             // Check for incoming messages, otherwise assume closing
-                            int count =
+                            ssize_t count =
                                 ::read(sd, (void *)buffer.data(), (std::size_t)buffer.size());
-                            if (count == 0 || count == (int)buffer.size() ||
+                            if (count == 0 || count == (ssize_t)buffer.size() ||
                                 !process_socket_action(sd, buffer.data(), count)) {
                                 close_all_files(sd);
-                                close(sd);
+                                ::close(sd);
                                 sd = 0;
                             }
                         }
                     }
                 } catch (const std::exception &e) {
-                    anarchofs::detail::log(
+                    anarchofs::detail::warning(
                         "Error happened in `anarchofs::server::socket_loop`: %s\n", e.what());
                 }
             }
@@ -1713,7 +1729,7 @@ namespace anarchofs {
                 }
                 return true;
             } catch (const std::exception &e) {
-                anarchofs::detail::log(
+                anarchofs::detail::warning(
                     "Error happened in `anarchofs::server::start_socket_loop`: %s\n", e.what());
                 return false;
             }
@@ -1730,7 +1746,7 @@ namespace anarchofs {
                 anarchofs::detail::log("socket loop stopped\n");
                 return true;
             } catch (const std::exception &e) {
-                anarchofs::detail::log(
+                anarchofs::detail::warning(
                     "Error happened in `anarchofs::server::stop_socket_loop`: %s\n", e.what());
                 return false;
             }
@@ -1789,7 +1805,7 @@ namespace anarchofs {
 
             std::vector<char> buffer_response(sizeof(FileId));
             if (::read(detail::get_socket(), buffer_response.data(), sizeof(FileId)) !=
-                sizeof(FileId))
+                (ssize_t)sizeof(FileId))
                 throw std::runtime_error("error reading from socket");
             FileId file_id = read_from_chars<FileId>(buffer_response.data());
             if (file_id > 0)
@@ -1825,12 +1841,14 @@ namespace anarchofs {
                 throw std::runtime_error("error writing to socket");
 
             std::vector<char> buffer_response(sizeof(std::int64_t) + n);
-            std::size_t response_size =
+            ssize_t response_size =
                 ::read(detail::get_socket(), buffer_response.data(), buffer_response.size());
-            if (response_size < sizeof(std::int64_t))
+            if (response_size < (ssize_t)sizeof(std::int64_t))
                 throw std::runtime_error("error reading from socket");
             std::int64_t error_or_size = read_from_chars<std::int64_t>(buffer_response.data());
             if (error_or_size <= 0) return error_or_size;
+            if (error_or_size + (ssize_t)sizeof(std::int64_t) != response_size)
+                throw std::runtime_error("anarchofs::client:read: incomplete message");
             std::copy_n(buffer_response.data() + sizeof(std::int64_t), error_or_size, v);
 
             // Advanced the cursor
@@ -1855,7 +1873,7 @@ namespace anarchofs {
 
             std::uint32_t response = 0;
             if (::read(detail::get_socket(), (void *)&response, sizeof(response)) !=
-                sizeof(response))
+                (ssize_t)sizeof(response))
                 throw std::runtime_error("error reading from socket");
             delete f;
             return response == 0;
