@@ -6,7 +6,7 @@ ifeq ($(AFS_WITH_FUSE), yes)
 endif
 
 anarchofs: anarchofs.cc anarchofs_lib.h Makefile
-	${CXX} ${CXXFLAGS} ${CXXFLAGS_FUSE} anarchofs.cc ${LIBS_FUSE} -o anarchofs
+	${CXX} ${CXXFLAGS} ${CXXFLAGS_FUSE} anarchofs.cc ${LIBS_FUSE} -lpthread -o anarchofs
 
 test_socket: test_socket.cc anarchofs_lib.h Makefile
 	${CXX} ${CXXFLAGS} test_socket.cc -o test_socket
