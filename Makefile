@@ -11,8 +11,11 @@ anarchofs: anarchofs.cc anarchofs_lib.h Makefile
 test_socket: test_socket.cc anarchofs_lib.h Makefile
 	${CXX} ${CXXFLAGS} test_socket.cc -o test_socket
 
+test_socket_mpi: test_socket.cc anarchofs_lib.h Makefile
+	${CXX} ${CXXFLAGS} -DUSE_MPI test_socket.cc -o test_socket_mpi
+
 clean:
-	rm -f anarchofs test_socket
+	rm -f anarchofs test_socket test_socket_mpi
 
 format:
 	clang-format -i anarchofs.cc anarchofs_lib.h test_socket.cc

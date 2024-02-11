@@ -1,6 +1,8 @@
 #include "anarchofs_lib.h"
 #include <cstdio>
-#include <mpi.h>
+#ifdef USE_MPI
+#    include <mpi.h>
+#endif
 
 /// Replace "@NPROC" by the process id in the given string; used for debugging
 /// \param path: given string
@@ -47,20 +49,27 @@ void check_file(const char *base_path, int id) {
 }
 
 int main(int argc, char **argv) {
-    int nprocs, rank;
+    int nprocs = 1, rank = 0;
+    (void)nprocs;
+#ifdef USE_MPI
     MPI_Init(&argc, &argv);
     MPI_Comm_size(MPI_COMM_WORLD, &nprocs);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+#endif
 
     // Read the path of the based filesystem
     const char *base_path = "/tmp";
     if (argc > 1) base_path = argv[1];
 
     if (rank == 0) create_file(base_path, 0);
+#ifdef USE_MPI
     MPI_Barrier(MPI_COMM_WORLD);
+#endif
 
     check_file(base_path, 0);
 
+#ifdef USE_MPI
     MPI_Finalize();
+#endif
     return 0;
 }

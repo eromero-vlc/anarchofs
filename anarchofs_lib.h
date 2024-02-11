@@ -46,6 +46,15 @@
 ///   if there is a path that is a file in one filesystem and a directory in other filesystem,
 ///   represented path as a file
 
+#ifdef BUILD_AFS_DAEMON
+#    include <mpi.h>
+#endif
+
+#ifdef AFS_DAEMON_USE_FUSE
+#    define FUSE_USE_VERSION 31
+#    include <fuse.h>
+#endif
+
 #include <algorithm>
 #include <cassert>
 #include <condition_variable>
@@ -53,12 +62,7 @@
 #include <cstring>
 #include <dirent.h>
 #include <functional>
-#ifdef AFS_DAEMON_USE_FUSE
-#    define FUSE_USE_VERSION 31
-#    include <fuse.h>
-#endif
 #include <memory>
-#include <mpi.h>
 #include <mutex>
 #include <set>
 #include <sstream>
@@ -86,6 +90,53 @@ namespace anarchofs {
     using FileId = unsigned int;
     constexpr FileId no_file_id = 0;
 
+    /// Common functions to daemons, server and client
+
+    namespace detail {
+        /// Write the given object into a string
+        /// \param t: object to write
+        /// \param s: pointer to the first element to write into
+
+        template <typename T> void write_as_chars(const T &t, char *s) {
+            std::copy_n((char *)&t, sizeof(T), s);
+        }
+
+        /// Read an object of type `T` from a string
+        /// \param s: pointer to the first element to read
+
+        template <typename T> T read_from_chars(const char *s) {
+            T t;
+            std::copy_n(s, sizeof(T), (char *)&t);
+            return t;
+        }
+
+#ifdef ANARCOFS_LOG
+        template <typename... Args> void log(const char *s, Args... args) {
+#    ifdef AFS_DAEMON_USE_FUSE
+            fuse_log(FUSE_LOG_DEBUG, s, args...);
+#    else
+            printf("[%d] ", get_proc_id());
+            printf(s, args...);
+            fflush(stdout);
+#    endif
+        }
+
+        template <typename... Args> void warning(const char *s, Args... args) {
+#    ifdef AFS_DAEMON_USE_FUSE
+            fuse_log(FUSE_LOG_DEBUG, s, args...);
+#    else
+            printf("[%d] warning: ", get_proc_id());
+            printf(s, args...);
+            fflush(stdout);
+#    endif
+        }
+#else
+        template <typename... Args> void log(const char *, Args...) {}
+        template <typename... Args> void warning(const char *, Args...) {}
+#endif
+    }
+
+#ifdef BUILD_AFS_DAEMON
     namespace detail {
 
         template <typename T> struct Buffer {
@@ -166,12 +217,12 @@ namespace anarchofs {
             int len;
             MPI_Error_string(error, s, &len);
 
-#define CHECK_AND_THROW(ERR)                                                                       \
-    if (error == ERR) {                                                                            \
-        std::stringstream ss;                                                                      \
-        ss << "MPI error: " #ERR ": " << std::string(&s[0], &s[0] + len);                          \
-        throw std::runtime_error(ss.str());                                                        \
-    }
+#    define CHECK_AND_THROW(ERR)                                                                   \
+        if (error == ERR) {                                                                        \
+            std::stringstream ss;                                                                  \
+            ss << "MPI error: " #ERR ": " << std::string(&s[0], &s[0] + len);                      \
+            throw std::runtime_error(ss.str());                                                    \
+        }
 
             CHECK_AND_THROW(MPI_ERR_BUFFER);
             CHECK_AND_THROW(MPI_ERR_COUNT);
@@ -193,7 +244,7 @@ namespace anarchofs {
             CHECK_AND_THROW(MPI_ERR_PENDING);
             CHECK_AND_THROW(MPI_ERR_REQUEST);
             CHECK_AND_THROW(MPI_ERR_LASTCODE);
-#undef CHECK_AND_THROW
+#    undef CHECK_AND_THROW
         }
 
         enum class Action : int {
@@ -294,23 +345,6 @@ namespace anarchofs {
             return path_s;
         }
 
-        /// Write the given object into a string
-        /// \param t: object to write
-        /// \param s: pointer to the first element to write into
-
-        template <typename T> void write_as_chars(const T &t, char *s) {
-            std::copy_n((char *)&t, sizeof(T), s);
-        }
-
-        /// Read an object of type `T` from a string
-        /// \param s: pointer to the first element to read
-
-        template <typename T> T read_from_chars(const char *s) {
-            T t;
-            std::copy_n(s, sizeof(T), (char *)&t);
-            return t;
-        }
-
         /// Type of the request numbers
 
         using RequestNum = unsigned int;
@@ -380,31 +414,6 @@ namespace anarchofs {
 
             const T &get_value_unsafe() const { return value; }
         };
-
-#ifdef ANARCOFS_LOG
-        template <typename... Args> void log(const char *s, Args... args) {
-#    ifdef AFS_DAEMON_USE_FUSE
-            fuse_log(FUSE_LOG_DEBUG, s, args...);
-#    else
-            printf("[%d] ", get_proc_id());
-            printf(s, args...);
-            fflush(stdout);
-#    endif
-        }
-
-        template <typename... Args> void warning(const char *s, Args... args) {
-#    ifdef AFS_DAEMON_USE_FUSE
-            fuse_log(FUSE_LOG_DEBUG, s, args...);
-#    else
-            printf("[%d] warning: ", get_proc_id());
-            printf(s, args...);
-            fflush(stdout);
-#    endif
-        }
-#else
-        template <typename... Args> void log(const char *, Args...) {}
-        template <typename... Args> void warning(const char *, Args...) {}
-#endif
     }
 
     ///
@@ -1452,10 +1461,13 @@ namespace anarchofs {
             return false;
         }
     }
+#endif // BUILD_AFS_DAEMON
 
     ///
     /// Client/server imitating a POSIX interface
     ///
+
+    /// Common functions to server and client
 
     namespace server {
         namespace detail {
@@ -1495,6 +1507,22 @@ namespace anarchofs {
                 return "/tmp/anarchofs.sock";
             }
 
+            inline bool read_from_socket(int socket, void *v, std::size_t size) {
+                std::size_t total_read = 0;
+                while (total_read < size) {
+                    ssize_t count =
+                        ::read(socket, (void *)((char *)v + total_read), size - total_read);
+                    if (count <= 0) return false;
+                    total_read += (std::size_t)count;
+                }
+                return true;
+            }
+        }
+    }
+
+#ifdef BUILD_AFS_DAEMON
+    namespace server {
+        namespace detail {
             /// Return the list of opened file ids associated to a socket
 
             inline std::unordered_map<int, std::set<FileId>> &get_opened_files_by_sockets() {
@@ -1514,17 +1542,6 @@ namespace anarchofs {
                 for (const auto &file_id : get_opened_files_by_sockets().at(socket))
                     close(file_id, [=](bool) {});
                 get_opened_files_by_sockets().erase(socket);
-            }
-
-            inline bool read_from_socket(int socket, void *v, std::size_t size) {
-                std::size_t total_read = 0;
-                while (total_read < size) {
-                    ssize_t count =
-                        ::read(socket, (void *)((char *)v + total_read), size - total_read);
-                    if (count <= 0) return false;
-                    total_read += (std::size_t)count;
-                }
-                return true;
             }
 
             inline bool process_socket_action(int socket) {
@@ -1783,6 +1800,7 @@ namespace anarchofs {
             }
         }
     }
+#endif // BUILD_AFS_DAEMON
 
     namespace client {
 
@@ -1825,12 +1843,12 @@ namespace anarchofs {
         /// \return: file handler or (null if failed)
 
         inline File *open(const char *filename) {
-            using namespace anarchofs::detail;
-
             int filename_size = strlen(filename);
             std::vector<char> buffer(sizeof(std::uint32_t) * 2 + filename_size);
-            write_as_chars((std::uint32_t)server::detail::Action::GlobalOpenRequest, buffer.data());
-            write_as_chars((std::uint32_t)filename_size, buffer.data() + sizeof(std::uint32_t));
+            anarchofs::detail::write_as_chars(
+                (std::uint32_t)server::detail::Action::GlobalOpenRequest, buffer.data());
+            anarchofs::detail::write_as_chars((std::uint32_t)filename_size,
+                                              buffer.data() + sizeof(std::uint32_t));
             std::copy_n(filename, filename_size, buffer.data() + sizeof(std::uint32_t) * 2);
             if (write(detail::get_socket(), buffer.data(), buffer.size()) != (ssize_t)buffer.size())
                 throw std::runtime_error("error writing to socket");
@@ -1857,17 +1875,17 @@ namespace anarchofs {
         /// \return: number of characters written into the buffer if positive; error code otherwise
 
         inline std::int64_t read(File *f, char *v, std::size_t n) {
-            using namespace anarchofs::detail;
-
             // Prepare the message
             std::vector<char> buffer(sizeof(std::uint32_t) + sizeof(FileId) +
                                      sizeof(std::size_t) * 2);
-            write_as_chars((std::uint32_t)server::detail::Action::ReadRequest, buffer.data());
-            write_as_chars(f->file_id, buffer.data() + sizeof(std::uint32_t));
-            write_as_chars((std::size_t)f->offset,
-                           buffer.data() + sizeof(std::uint32_t) + sizeof(FileId));
-            write_as_chars((std::size_t)n, buffer.data() + sizeof(std::uint32_t) + sizeof(FileId) +
-                                               sizeof(std::size_t));
+            anarchofs::detail::write_as_chars((std::uint32_t)server::detail::Action::ReadRequest,
+                                              buffer.data());
+            anarchofs::detail::write_as_chars(f->file_id, buffer.data() + sizeof(std::uint32_t));
+            anarchofs::detail::write_as_chars(
+                (std::size_t)f->offset, buffer.data() + sizeof(std::uint32_t) + sizeof(FileId));
+            anarchofs::detail::write_as_chars((std::size_t)n,
+                                              buffer.data() + sizeof(std::uint32_t) +
+                                                  sizeof(FileId) + sizeof(std::size_t));
             if (write(detail::get_socket(), buffer.data(), buffer.size()) != (ssize_t)buffer.size())
                 throw std::runtime_error("error writing to socket");
 
@@ -1891,12 +1909,11 @@ namespace anarchofs {
         /// \return: whether the operation was successful
 
         inline bool close(File *f) {
-            using namespace anarchofs::detail;
-
             // Prepare the message
             std::vector<char> buffer(sizeof(std::uint32_t) + sizeof(FileId));
-            write_as_chars((std::uint32_t)server::detail::Action::CloseRequest, buffer.data());
-            write_as_chars(f->file_id, buffer.data() + sizeof(std::uint32_t));
+            anarchofs::detail::write_as_chars((std::uint32_t)server::detail::Action::CloseRequest,
+                                              buffer.data());
+            anarchofs::detail::write_as_chars(f->file_id, buffer.data() + sizeof(std::uint32_t));
             if (write(detail::get_socket(), buffer.data(), buffer.size()) != (ssize_t)buffer.size())
                 throw std::runtime_error("error writing to socket");
 

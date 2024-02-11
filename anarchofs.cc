@@ -1,5 +1,6 @@
 /// AnarchoFS daemon
 
+#define BUILD_AFS_DAEMON
 #include "anarchofs_lib.h"
 
 #ifdef AFS_DAEMON_USE_FUSE
