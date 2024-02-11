@@ -399,7 +399,6 @@ namespace anarchofs {
             printf("[%d] warning: ", get_proc_id());
             printf(s, args...);
             fflush(stdout);
-            throw std::runtime_error("wtf");
 #    endif
         }
 #else
@@ -1464,7 +1463,8 @@ namespace anarchofs {
                 GlobalOpenRequest,
                 /// Package description:
                 /// - request_action:uint32 = GlobalOpenRequest
-                /// - path:null-ending string
+                /// - path_length:uint32
+                /// - path:char[path_length]
                 ///
                 /// Answer:
                 /// - file_id::size_t (> 0, or == 0 for error)
@@ -1478,7 +1478,7 @@ namespace anarchofs {
                 ///
                 /// Answer:
                 /// - size_or_error:int64_t
-                /// - content:char[size]
+                /// - content:char[max(0,size_or_error)]
 
                 CloseRequest,
                 /// Package description:
@@ -1516,22 +1516,47 @@ namespace anarchofs {
                 get_opened_files_by_sockets().erase(socket);
             }
 
-            inline bool process_socket_action(int socket, const char *buffer,
-                                              unsigned int message_size) {
+            inline bool read_from_socket(int socket, void *v, std::size_t size) {
+                std::size_t total_read = 0;
+                while (total_read < size) {
+                    ssize_t count =
+                        ::read(socket, (void *)((char *)v + total_read), size - total_read);
+                    if (count <= 0) return false;
+                    total_read += (std::size_t)count;
+                }
+                return true;
+            }
+
+            inline bool process_socket_action(int socket) {
                 using namespace anarchofs::detail;
 
                 // Read the request_action
-                Action action = (Action)read_from_chars<std::uint32_t>(buffer);
-                const char *msg = buffer + sizeof(std::uint32_t);
+                std::uint32_t action_buffer;
+                if (!read_from_socket(socket, &action_buffer, sizeof(action_buffer))) {
+                    warning("process_socket_action: error reading action");
+                    return false;
+                }
+                Action action = (Action)action_buffer;
+
+                // Process action
                 switch (action) {
                 case Action::GlobalOpenRequest: {
                     // Get path
-                    std::string path(msg, msg + message_size);
+                    std::uint32_t path_length;
+                    if (!read_from_socket(socket, &path_length, sizeof(path_length))) {
+                        warning("process_socket_action: error reading path_length");
+                        return false;
+                    }
+                    std::vector<char> path(path_length + 1);
+                    if (!read_from_socket(socket, path.data(), path_length)) {
+                        warning("process_socket_action: error reading path");
+                        return false;
+                    }
 
-                    log("socket open socket: %d path: %s\n", socket, path.c_str());
+                    log("socket open socket: %d path: %s\n", socket, path.data());
 
                     // Open file
-                    get_open_file(path.c_str(), [=](FileId file_id) {
+                    get_open_file(path.data(), [=](FileId file_id) {
                         log("socket open socket: %d returning: %d\n", socket, (int)file_id);
 
                         // Track opened files by the socket
@@ -1545,12 +1570,18 @@ namespace anarchofs {
                 }
 
                 case Action::ReadRequest: {
+                    std::vector<char> msg(sizeof(FileId) + sizeof(Offset) * 2);
+                    if (!read_from_socket(socket, msg.data(), msg.size())) {
+                        warning("process_socket_action: error reading read request");
+                        return false;
+                    }
                     // Read file id
-                    FileId file_id = read_from_chars<FileId>(msg);
+                    FileId file_id = read_from_chars<FileId>(msg.data());
                     // Read Offset
-                    Offset offset = read_from_chars<Offset>(msg + sizeof(FileId));
+                    Offset offset = read_from_chars<Offset>(msg.data() + sizeof(FileId));
                     // Read size
-                    Offset size = read_from_chars<Offset>(msg + sizeof(FileId) + sizeof(Offset));
+                    Offset size =
+                        read_from_chars<Offset>(msg.data() + sizeof(FileId) + sizeof(Offset));
                     // Make the read
                     auto read_buffer =
                         std::make_shared<std::vector<char>>(sizeof(std::int64_t) + size);
@@ -1572,7 +1603,11 @@ namespace anarchofs {
 
                 case Action::CloseRequest: {
                     // Read file id
-                    FileId file_id = read_from_chars<FileId>(msg);
+                    FileId file_id;
+                    if (!read_from_socket(socket, &file_id, sizeof(file_id))) {
+                        warning("process_socket_action: error reading file_id");
+                        return false;
+                    }
 
                     // Track opened files by the socket
                     if (get_opened_files_by_sockets().at(socket).count(file_id) == 1)
@@ -1646,7 +1681,6 @@ namespace anarchofs {
                     is_socket_initialized() = true;
 
                     std::vector<int> client_sockets;
-                    std::vector<char> buffer(sizeof(std::uint32_t) + (std::size_t)PATH_MAX);
                     while (!get_finalize_socket_thread()) {
                         fd_set readfds;
 
@@ -1696,10 +1730,7 @@ namespace anarchofs {
                             if (!FD_ISSET(sd, &readfds)) continue;
 
                             // Check for incoming messages, otherwise assume closing
-                            ssize_t count =
-                                ::read(sd, (void *)buffer.data(), (std::size_t)buffer.size());
-                            if (count == 0 || count == (ssize_t)buffer.size() ||
-                                !process_socket_action(sd, buffer.data(), count)) {
+                            if (!process_socket_action(sd)) {
                                 close_all_files(sd);
                                 ::close(sd);
                                 sd = 0;
@@ -1797,18 +1828,17 @@ namespace anarchofs {
             using namespace anarchofs::detail;
 
             int filename_size = strlen(filename);
-            std::vector<char> buffer(sizeof(uint32_t) + filename_size);
+            std::vector<char> buffer(sizeof(std::uint32_t) * 2 + filename_size);
             write_as_chars((std::uint32_t)server::detail::Action::GlobalOpenRequest, buffer.data());
-            std::copy_n(filename, filename_size, buffer.data() + sizeof(uint32_t));
+            write_as_chars((std::uint32_t)filename_size, buffer.data() + sizeof(std::uint32_t));
+            std::copy_n(filename, filename_size, buffer.data() + sizeof(std::uint32_t) * 2);
             if (write(detail::get_socket(), buffer.data(), buffer.size()) != (ssize_t)buffer.size())
                 throw std::runtime_error("error writing to socket");
 
-            std::vector<char> buffer_response(sizeof(FileId));
-            if (::read(detail::get_socket(), buffer_response.data(), sizeof(FileId)) !=
-                (ssize_t)sizeof(FileId))
+            FileId file_id;
+            if (!server::detail::read_from_socket(detail::get_socket(), &file_id, sizeof(file_id)))
                 throw std::runtime_error("error reading from socket");
-            FileId file_id = read_from_chars<FileId>(buffer_response.data());
-            if (file_id > 0)
+            if (file_id != no_file_id)
                 return new File{file_id, 0};
             else
                 return nullptr;
@@ -1830,7 +1860,8 @@ namespace anarchofs {
             using namespace anarchofs::detail;
 
             // Prepare the message
-            std::vector<char> buffer(sizeof(uint32_t) + sizeof(FileId) + sizeof(std::size_t) * 2);
+            std::vector<char> buffer(sizeof(std::uint32_t) + sizeof(FileId) +
+                                     sizeof(std::size_t) * 2);
             write_as_chars((std::uint32_t)server::detail::Action::ReadRequest, buffer.data());
             write_as_chars(f->file_id, buffer.data() + sizeof(std::uint32_t));
             write_as_chars((std::size_t)f->offset,
@@ -1840,16 +1871,14 @@ namespace anarchofs {
             if (write(detail::get_socket(), buffer.data(), buffer.size()) != (ssize_t)buffer.size())
                 throw std::runtime_error("error writing to socket");
 
-            std::vector<char> buffer_response(sizeof(std::int64_t) + n);
-            ssize_t response_size =
-                ::read(detail::get_socket(), buffer_response.data(), buffer_response.size());
-            if (response_size < (ssize_t)sizeof(std::int64_t))
+            // Process answer
+            std::int64_t error_or_size;
+            if (!server::detail::read_from_socket(detail::get_socket(), &error_or_size,
+                                                  sizeof(error_or_size)))
                 throw std::runtime_error("error reading from socket");
-            std::int64_t error_or_size = read_from_chars<std::int64_t>(buffer_response.data());
             if (error_or_size <= 0) return error_or_size;
-            if (error_or_size + (ssize_t)sizeof(std::int64_t) != response_size)
-                throw std::runtime_error("anarchofs::client:read: incomplete message");
-            std::copy_n(buffer_response.data() + sizeof(std::int64_t), error_or_size, v);
+            if (!server::detail::read_from_socket(detail::get_socket(), v, error_or_size))
+                throw std::runtime_error("error reading from socket");
 
             // Advanced the cursor
             f->offset += error_or_size;
@@ -1865,15 +1894,15 @@ namespace anarchofs {
             using namespace anarchofs::detail;
 
             // Prepare the message
-            std::vector<char> buffer(sizeof(uint32_t) + sizeof(FileId));
+            std::vector<char> buffer(sizeof(std::uint32_t) + sizeof(FileId));
             write_as_chars((std::uint32_t)server::detail::Action::CloseRequest, buffer.data());
             write_as_chars(f->file_id, buffer.data() + sizeof(std::uint32_t));
             if (write(detail::get_socket(), buffer.data(), buffer.size()) != (ssize_t)buffer.size())
                 throw std::runtime_error("error writing to socket");
 
             std::uint32_t response = 0;
-            if (::read(detail::get_socket(), (void *)&response, sizeof(response)) !=
-                (ssize_t)sizeof(response))
+            if (!server::detail::read_from_socket(detail::get_socket(), &response,
+                                                  sizeof(response)))
                 throw std::runtime_error("error reading from socket");
             delete f;
             return response == 0;
