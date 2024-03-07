@@ -62,6 +62,7 @@
 #include <cstring>
 #include <dirent.h>
 #include <functional>
+#include <iomanip>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -111,6 +112,8 @@ namespace anarchofs {
         }
 
 #ifdef ANARCOFS_LOG
+        inline unsigned int &get_proc_id();
+
         template <typename... Args> void log(const char *s, Args... args) {
 #    ifdef AFS_DAEMON_USE_FUSE
             fuse_log(FUSE_LOG_DEBUG, s, args...);
@@ -138,6 +141,104 @@ namespace anarchofs {
 
 #ifdef BUILD_AFS_DAEMON
     namespace detail {
+
+        /// Performance metrics, time, memory usage, etc
+
+        struct Metric {
+            double cpu_time;   ///< wall-clock time for the cpu
+            double memops;     ///< bytes read and write from memory
+            std::size_t calls; ///< number of times the function was called
+            Metric() : cpu_time(0), memops(0), calls(0) {}
+        };
+
+        /// Type for storing the timings
+
+        using Timings = std::unordered_map<std::string, Metric>;
+
+        /// Return the performance timings
+
+        inline Timings &getTimings() {
+            static Timings timings{16};
+            return timings;
+        }
+
+        /// Track time between creation and destruction of the object
+
+        struct tracker {
+            /// Bytes read and write from memory
+            double memops;
+
+#    ifdef AFS_DAEMON_TRACK_TIME
+            /// Whether the tacker has been stopped
+            bool stopped;
+            /// Name of the function being tracked
+            const std::string func_name;
+            /// Instant of the construction
+            const std::chrono::time_point<std::chrono::system_clock> start;
+
+            /// Start a tracker
+            tracker(const std::string &func_name)
+                : memops(0),
+                  stopped(false),
+                  func_name(func_name),
+                  start(std::chrono::system_clock::now()) {}
+
+            ~tracker() { stop(); }
+
+            /// Stop the tracker and store the timing
+            void stop() {
+                if (stopped) return;
+                stopped = true;
+
+                // Count elapsed time since the creation of the object
+                double elapsed_time =
+                    std::chrono::duration<double>(std::chrono::system_clock::now() - start).count();
+
+                // Record the time
+                auto &timing = getTimings()[func_name];
+                timing.cpu_time += elapsed_time;
+                timing.memops += memops;
+                timing.calls++;
+            }
+#    else
+            tracker(const std::string &) {}
+#    endif
+
+            // Forbid copy constructor and assignment operator
+            tracker(const tracker &) = delete;
+            tracker &operator=(tracker const &) = delete;
+        };
+
+        /// Report all tracked timings
+        /// \param s: stream to write the report
+
+        template <typename OStream> void reportTimings(OStream &s) {
+            // Print the timings alphabetically
+            s << "Timing of kernels:" << std::endl;
+            s << "------------------" << std::endl;
+            const auto &timings = getTimings();
+            std::vector<std::string> names;
+            for (const auto &it : timings) names.push_back(it.first);
+            std::sort(names.begin(), names.end());
+
+            for (const auto &name : names) {
+                // Gather the metrics for a given function on all sessions
+                auto metric = getTimings().at(name);
+                auto time = metric.cpu_time;
+                auto memops = metric.memops;
+                auto calls = metric.calls;
+
+                double gmemops_per_sec = (time > 0 ? memops / time : 0) / 1024.0 / 1024.0 / 1024.0;
+                s << name << " : " << std::fixed << std::setprecision(3) << time << " s ("
+                  << "calls: " << std::setprecision(0) << calls //
+                  << " bytes: " << memops                       //
+                  << " GBYTES/s: " << gmemops_per_sec           //
+                  << " )" << std::endl;
+            }
+            s << std::defaultfloat;
+        }
+
+        /// Channel between two threads
 
         template <typename T> struct Buffer {
         private:
@@ -864,6 +965,8 @@ namespace anarchofs {
             }
 
             inline void response_global_open_file_request(int rank, int message_size) {
+		tracker t_("open file processing requests");
+
                 std::vector<char> buffer(message_size + 1);
                 MPI_Status status;
                 check_mpi(MPI_Recv(buffer.data(), message_size, MPI_CHAR, rank,
@@ -895,6 +998,8 @@ namespace anarchofs {
             }
 
             inline void response_global_open_file_answer(int rank, int message_size) {
+		tracker t_("open file processing answers");
+
                 std::vector<char> buffer(message_size);
                 MPI_Status status;
                 check_mpi(MPI_Recv(buffer.data(), message_size, MPI_CHAR, rank,
@@ -917,6 +1022,8 @@ namespace anarchofs {
         using namespace detail;
         using namespace detail_open_file;
 
+        detail::tracker t_("open file api");
+
         static RequestNum next_req = 0;
         RequestNum first_req = next_req;
         next_req += get_num_procs();
@@ -934,6 +1041,8 @@ namespace anarchofs {
             std::string(sizeof(RequestNum) + sizeof(FileId), 0) + std::string(path);
         write_as_chars(file_id, &msg_pattern[sizeof(RequestNum)]);
         const auto sender = [=](std::function<void()> process) {
+            detail::tracker t_("open file sending requests");
+
             // Prepare the responses
             TickingCallback callback(process);
             for (unsigned int rank = 0; rank < get_num_procs(); ++rank)
@@ -1031,6 +1140,8 @@ namespace anarchofs {
             }
 
             inline void response_read_request(int rank, int message_size) {
+		tracker t_("read file processing requests");
+
                 std::vector<char> buffer(message_size);
                 MPI_Status status;
                 check_mpi(MPI_Recv(buffer.data(), message_size, MPI_CHAR, rank,
@@ -1066,6 +1177,8 @@ namespace anarchofs {
             }
 
             inline void response_read_answer(int rank, int message_size) {
+		tracker t_("read file processing answers");
+
                 std::vector<char> buffer(message_size);
                 MPI_Status status;
                 check_mpi(MPI_Recv(buffer.data(), message_size, MPI_CHAR, rank,
@@ -1076,6 +1189,8 @@ namespace anarchofs {
                 auto &v = get_read_pending_transactions().at(request_num);
                 std::copy_n(msg_it, count, v.buffer);
                 v.count = count;
+                t_.stop();
+		tracker t0_("read file processing answers callback");
                 v.callback.call();
             }
         }
@@ -1093,6 +1208,8 @@ namespace anarchofs {
         using namespace detail;
         using namespace detail_read;
 
+        detail::tracker t_("read file api");
+
         // Quick answer if the count is zero
         if (count == 0) {
             response_callback(0);
@@ -1109,6 +1226,8 @@ namespace anarchofs {
 
         // Queue the requests
         auto send = [=](const std::function<void()> &process) {
+            detail::tracker t_("read file sending requests");
+
             // Quick answer if the file_id does not exists
             if (get_open_files_cache().count(file_id) == 0) {
                 response_callback(-1);
@@ -1330,6 +1449,11 @@ namespace anarchofs {
                 get_num_procs() = nprocs;
                 get_proc_id() = this_proc;
 
+#    ifdef AFS_DAEMON_TRACK_TIME
+                std::chrono::time_point<std::chrono::system_clock> last_report =
+                    std::chrono::system_clock::now();
+#    endif
+
                 auto &buffer = get_func_buffer();
                 while (!get_finalize_mpi_thread()) {
                     bool something_done = false;
@@ -1413,6 +1537,15 @@ namespace anarchofs {
                         buffer.pop_front()();
                         something_done = true;
                     }
+
+#    ifdef AFS_DAEMON_TRACK_TIME
+                    const auto now = std::chrono::system_clock::now();
+                    if (std::chrono::duration<double>(now - last_report).count() >
+                        10 /* 5 mins */) {
+                        detail::reportTimings(std::cout);
+			last_report = now;
+                    }
+#    endif
 
                     if (!something_done) std::this_thread::yield();
                 }
