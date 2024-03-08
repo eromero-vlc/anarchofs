@@ -405,8 +405,8 @@ namespace anarchofs {
         const int MaxAction = 16;
 
         struct MPI_RequestBuffer {
-            MPI_Request request;                 ///< MPI request handler
-            std::shared_ptr<std::string> buffer; ///< buffer associated to the request
+            MPI_Request request;          ///< MPI request handler
+            std::shared_ptr<char> buffer; ///< buffer associated to the request
         };
 
         /// Return the list of pending requests
@@ -555,7 +555,12 @@ namespace anarchofs {
                 std::string path_hack = replace_hack(path);
                 log("getting requesting get_file_status from %d: %s\n", rank, path_hack.c_str());
 
-                std::string response(sizeof(RequestNum) + sizeof(FileType) + sizeof(Offset), 0);
+                std::size_t response_buffer_size =
+                    sizeof(RequestNum) + sizeof(FileType) + sizeof(Offset);
+                auto response_buffer = std::shared_ptr<char>(new char[response_buffer_size],
+                                                             std::default_delete<char[]>());
+                auto response = response_buffer.get();
+
                 set_request_num(request_num, &response[0]);
 
                 struct stat st;
@@ -575,13 +580,10 @@ namespace anarchofs {
                 write_as_chars(file_type, &response[sizeof(RequestNum)]);
                 write_as_chars(file_size, &response[sizeof(RequestNum) + sizeof(FileType)]);
 
-                auto &pending_requests = get_pending_mpi_requests();
-                pending_requests.resize(pending_requests.size() + 1);
-                auto &pending_request = pending_requests.back();
-                pending_request.buffer = std::make_shared<std::string>(std::move(response));
-                check_mpi(MPI_Isend(pending_request.buffer->data(), pending_request.buffer->size(),
-                                    MPI_CHAR, rank, (int)Action::GetFileStatusAnswer,
-                                    MPI_COMM_WORLD, &pending_request.request));
+                MPI_Request req;
+                check_mpi(MPI_Isend(response, response_buffer_size, MPI_CHAR, rank,
+                                    (int)Action::GetFileStatusAnswer, MPI_COMM_WORLD, &req));
+                get_pending_mpi_requests().push_back(MPI_RequestBuffer{req, response_buffer});
             }
 
             inline void response_file_status_answer(int rank, int message_size) {
@@ -638,16 +640,16 @@ namespace anarchofs {
         std::string msg_pattern = std::string(sizeof(RequestNum), 0) + std::string(path);
         get_func_buffer().push_back([=]() {
             log("send file_status requests %s\n", msg_pattern.c_str() + sizeof(RequestNum));
-            auto &pending_requests = get_pending_mpi_requests();
             for (unsigned int rank = 0; rank < get_num_procs(); ++rank) {
-                std::string this_msg_pattern = msg_pattern;
-                set_request_num(first_req + rank, &this_msg_pattern[0]);
-                pending_requests.resize(pending_requests.size() + 1);
-                auto &pending_request = pending_requests.back();
-                pending_request.buffer = std::make_shared<std::string>(std::move(this_msg_pattern));
-                check_mpi(MPI_Isend(pending_request.buffer->data(), pending_request.buffer->size(),
-                                    MPI_CHAR, rank, (int)Action::GetFileStatusRequest,
-                                    MPI_COMM_WORLD, &pending_request.request));
+                auto this_msg_pattern_buffer = std::shared_ptr<char>(new char[msg_pattern.size()],
+                                                                     std::default_delete<char[]>());
+                std::copy_n(msg_pattern.begin(), msg_pattern.size(), this_msg_pattern_buffer.get());
+                set_request_num(first_req + rank, this_msg_pattern_buffer.get());
+                MPI_Request req;
+                check_mpi(MPI_Isend(this_msg_pattern_buffer.get(), msg_pattern.size(), MPI_CHAR,
+                                    rank, (int)Action::GetFileStatusRequest, MPI_COMM_WORLD, &req));
+                get_pending_mpi_requests().push_back(
+                    MPI_RequestBuffer{req, this_msg_pattern_buffer});
             }
         });
 
@@ -723,14 +725,13 @@ namespace anarchofs {
                     closedir(dp);
                 }
 
-                auto &pending_requests = get_pending_mpi_requests();
-                pending_requests.resize(pending_requests.size() + 1);
-                auto &pending_request = pending_requests.back();
-                pending_request.buffer =
-                    std::make_shared<std::string>(response.begin(), response.end());
-                check_mpi(MPI_Isend(pending_request.buffer->data(), pending_request.buffer->size(),
-                                    MPI_CHAR, rank, (int)Action::GetDirectoryListAnswer,
-                                    MPI_COMM_WORLD, &pending_request.request));
+                auto response_buffer =
+                    std::shared_ptr<char>(new char[response.size()], std::default_delete<char[]>());
+                std::copy(response.begin(), response.end(), response_buffer.get());
+                MPI_Request req;
+                check_mpi(MPI_Isend(response_buffer.get(), response.size(), MPI_CHAR, rank,
+                                    (int)Action::GetDirectoryListAnswer, MPI_COMM_WORLD, &req));
+                get_pending_mpi_requests().push_back(MPI_RequestBuffer{req, response_buffer});
             }
 
             inline void response_get_directory_list_answer(int rank, int message_size) {
@@ -786,16 +787,17 @@ namespace anarchofs {
         std::string msg_pattern = std::string(sizeof(RequestNum), 0) + std::string(path);
         get_func_buffer().push_back([=]() {
             log("send get_directory_list requests %s\n", msg_pattern.c_str() + sizeof(RequestNum));
-            auto &pending_requests = get_pending_mpi_requests();
             for (unsigned int rank = 0; rank < get_num_procs(); ++rank) {
-                std::string this_msg_pattern = msg_pattern;
-                set_request_num(first_req + rank, &this_msg_pattern[0]);
-                pending_requests.resize(pending_requests.size() + 1);
-                auto &pending_request = pending_requests.back();
-                pending_request.buffer = std::make_shared<std::string>(std::move(this_msg_pattern));
-                check_mpi(MPI_Isend(pending_request.buffer->data(), pending_request.buffer->size(),
-                                    MPI_CHAR, rank, (int)Action::GetDirectoryListRequest,
-                                    MPI_COMM_WORLD, &pending_request.request));
+                auto this_msg_pattern_buffer = std::shared_ptr<char>(new char[msg_pattern.size()],
+                                                                     std::default_delete<char[]>());
+                std::copy_n(msg_pattern.begin(), msg_pattern.size(), this_msg_pattern_buffer.get());
+                set_request_num(first_req + rank, this_msg_pattern_buffer.get());
+                MPI_Request req;
+                check_mpi(MPI_Isend(this_msg_pattern_buffer.get(), msg_pattern.size(), MPI_CHAR,
+                                    rank, (int)Action::GetDirectoryListRequest, MPI_COMM_WORLD,
+                                    &req));
+                get_pending_mpi_requests().push_back(
+                    MPI_RequestBuffer{req, this_msg_pattern_buffer});
             }
         });
 
@@ -828,10 +830,10 @@ namespace anarchofs {
     namespace detail {
 
 #    ifdef AFS_DAEMON_USE_MPIIO
-	using FileHandle = MPI_File;
+        using FileHandle = MPI_File;
 
-        inline bool file_open(const char *filename, MPI_File&f) {
-            return MPI_File_open(MPI_COMM_SELF, filename, MPI_MODE_RDONLY, MPI_INFO_NULL, f) ==
+        inline bool file_open(const char *filename, MPI_File &f) {
+            return MPI_File_open(MPI_COMM_SELF, filename, MPI_MODE_RDONLY, MPI_INFO_NULL, &f) ==
                    MPI_SUCCESS;
         }
 
@@ -848,7 +850,7 @@ namespace anarchofs {
             return req;
         }
 
-        inline void file_close(File_Requests &f) { check_mpi(MPI_File_close(&f)); }
+        inline void file_close(MPI_File &f) { check_mpi(MPI_File_close(&f)); }
 #    else
         using FileHandle = std::FILE *;
 
@@ -1007,7 +1009,7 @@ namespace anarchofs {
             }
 
             inline void response_global_open_file_request(int rank, int message_size) {
-		tracker t_("open file processing requests");
+                tracker t_("open file processing requests");
 
                 std::vector<char> buffer(message_size + 1);
                 MPI_Status status;
@@ -1021,7 +1023,11 @@ namespace anarchofs {
                 log("mpi open id: %d process response from: %d: file: %s\n", (int)file_id, rank,
                     path_hack.c_str());
 
-                std::string response(sizeof(RequestNum) + sizeof(Offset), 0);
+                std::size_t response_buffer_size = sizeof(RequestNum) + sizeof(Offset);
+                auto response_buffer = std::shared_ptr<char>(new char[response_buffer_size],
+                                                             std::default_delete<char[]>());
+                auto response = response_buffer.get();
+
                 set_request_num(request_num, &response[0]);
 
                 FileHandle f;
@@ -1031,17 +1037,14 @@ namespace anarchofs {
                 if (success) file_size_plus_one = get_file_size(f) + 1;
                 write_as_chars(file_size_plus_one, &response[sizeof(RequestNum)]);
 
-                auto &pending_requests = get_pending_mpi_requests();
-                pending_requests.resize(pending_requests.size() + 1);
-                auto &pending_request = pending_requests.back();
-                pending_request.buffer = std::make_shared<std::string>(std::move(response));
-                check_mpi(MPI_Isend(pending_request.buffer->data(), pending_request.buffer->size(),
-                                    MPI_CHAR, rank, (int)Action::GlobalOpenAnswer, MPI_COMM_WORLD,
-                                    &pending_request.request));
+                MPI_Request req;
+                check_mpi(MPI_Isend(response, response_buffer_size, MPI_CHAR, rank,
+                                    (int)Action::GlobalOpenAnswer, MPI_COMM_WORLD, &req));
+                get_pending_mpi_requests().push_back(MPI_RequestBuffer{req, response_buffer});
             }
 
             inline void response_global_open_file_answer(int rank, int message_size) {
-		tracker t_("open file processing answers");
+                tracker t_("open file processing answers");
 
                 std::vector<char> buffer(message_size);
                 MPI_Status status;
@@ -1094,16 +1097,16 @@ namespace anarchofs {
 
             // Send the requests
             //log("send get_open_file requests %d\n", file_id);
-            auto &pending_requests = get_pending_mpi_requests();
             for (unsigned int rank = 0; rank < get_num_procs(); ++rank) {
-                std::string this_msg_pattern = msg_pattern;
-                set_request_num(first_req + rank, &this_msg_pattern[0]);
-                pending_requests.resize(pending_requests.size() + 1);
-                auto &pending_request = pending_requests.back();
-                pending_request.buffer = std::make_shared<std::string>(std::move(this_msg_pattern));
-                check_mpi(MPI_Isend(pending_request.buffer->data(), pending_request.buffer->size(),
-                                    MPI_CHAR, rank, (int)Action::GlobalOpenRequest, MPI_COMM_WORLD,
-                                    &pending_request.request));
+                auto this_msg_pattern_buffer = std::shared_ptr<char>(new char[msg_pattern.size()],
+                                                                     std::default_delete<char[]>());
+                std::copy_n(msg_pattern.begin(), msg_pattern.size(), this_msg_pattern_buffer.get());
+                set_request_num(first_req + rank, this_msg_pattern_buffer.get());
+                MPI_Request req;
+                check_mpi(MPI_Isend(this_msg_pattern_buffer.get(), msg_pattern.size(), MPI_CHAR,
+                                    rank, (int)Action::GlobalOpenRequest, MPI_COMM_WORLD, &req));
+                get_pending_mpi_requests().push_back(
+                    MPI_RequestBuffer{req, this_msg_pattern_buffer});
             }
         };
 
@@ -1166,8 +1169,8 @@ namespace anarchofs {
 
     namespace detail {
         struct MPI_RequestCallback {
-            MPI_Request request;                 ///< MPI request handler
-            TickingCallback callback;            ///< callback associated to the request
+            MPI_Request request;      ///< MPI request handler
+            TickingCallback callback; ///< callback associated to the request
         };
 
         /// Return the list of pending requests
@@ -1180,7 +1183,7 @@ namespace anarchofs {
 
         namespace detail_read {
             inline void response_read_request(int rank, int message_size) {
-		tracker t_("read file processing requests");
+                tracker t_("read file processing requests");
 
                 std::vector<char> buffer(message_size);
                 MPI_Status status;
@@ -1195,23 +1198,37 @@ namespace anarchofs {
                 log("mpi read request: %d id: %d from: %d size: %d\n", (int)request_num,
                     (int)file_id, (int)local_offset, (int)local_size);
 
-                std::string response(local_size, 0);
+                auto response_buffer =
+                    std::shared_ptr<char>(new char[local_size], std::default_delete<char[]>());
 
-                tracker t0_("read file processing requests (fread)");
+                tracker t0_("read file processing requests (file_read)");
                 FileHandle f;
                 if (!get_local_opened_files().get_file_handler(FromAndFileId{rank, file_id}, f))
                     throw std::runtime_error("response_read_request: file_id is not a valid");
-                file_read(f, local_offset, &response[0], local_size);
+#    ifdef AFS_DAEMON_USE_MPIIO
+                MPI_Request req = file_read(f, local_offset, response_buffer.get(), local_size);
+                get_pending_mpi_request_callbacks().push_back(MPI_RequestCallback{
+                    req, TickingCallback([=]() {
+                        tracker t_("read file processing requests (MPI_Isend)");
+                        MPI_Request req;
+                        check_mpi(MPI_Isend(response_buffer.get(), local_size, MPI_CHAR, rank,
+                                            (int)Action::ReadAnswer + (int)request_num * MaxAction,
+                                            MPI_COMM_WORLD, &req));
+                        get_pending_mpi_requests().push_back(
+                            MPI_RequestBuffer{req, response_buffer});
+                    })});
+
+#    else
+                file_read(f, local_offset, response_buffer.get(), local_size);
                 t0_.stop();
 
-                auto &pending_requests = get_pending_mpi_requests();
-                pending_requests.resize(pending_requests.size() + 1);
-                auto &pending_request = pending_requests.back();
-                pending_request.buffer = std::make_shared<std::string>(std::move(response));
                 tracker t1_("read file processing requests (MPI_Isend)");
-                check_mpi(MPI_Isend(pending_request.buffer->data(), local_size, MPI_CHAR, rank,
+                MPI_Request req;
+                check_mpi(MPI_Isend(response_buffer.get(), local_size, MPI_CHAR, rank,
                                     (int)Action::ReadAnswer + (int)request_num * MaxAction,
-                                    MPI_COMM_WORLD, &pending_request.request));
+                                    MPI_COMM_WORLD, &req));
+                get_pending_mpi_requests().push_back(MPI_RequestBuffer{req, response_buffer});
+#    endif
             }
         }
     }
@@ -1280,11 +1297,13 @@ namespace anarchofs {
             }
 
             //log("mpi read (send) request: %d\n", (int)first_req);
-            auto &pending_requests = get_pending_mpi_requests();
             for (unsigned int rank = 0; rank < get_num_procs(); ++rank) {
                 if (local_counts[rank] == 0) continue;
-                std::string this_msg_pattern =
-                    std::string(sizeof(RequestNum) + sizeof(FileId) + sizeof(Offset) * 2, 0);
+                std::size_t this_msg_pattern_size =
+                    sizeof(RequestNum) + sizeof(FileId) + sizeof(Offset) * 2;
+                auto this_msg_pattern_buffer = std::shared_ptr<char>(
+                    new char[this_msg_pattern_size], std::default_delete<char[]>());
+                auto this_msg_pattern = this_msg_pattern_buffer.get();
                 set_request_num(RequestNum(next_tag_request_number[rank]), &this_msg_pattern[0]);
                 write_as_chars(file_id, &this_msg_pattern[sizeof(RequestNum)]);
                 write_as_chars(local_offsets[rank],
@@ -1292,12 +1311,11 @@ namespace anarchofs {
                 write_as_chars(
                     local_counts[rank],
                     &this_msg_pattern[sizeof(RequestNum) + sizeof(FileId) + sizeof(Offset)]);
-                pending_requests.resize(pending_requests.size() + 1);
-                auto &pending_request = pending_requests.back();
-                pending_request.buffer = std::make_shared<std::string>(std::move(this_msg_pattern));
-                check_mpi(MPI_Isend(pending_request.buffer->data(), pending_request.buffer->size(),
-                                    MPI_CHAR, rank, (int)Action::ReadRequest, MPI_COMM_WORLD,
-                                    &pending_request.request));
+                MPI_Request req;
+                check_mpi(MPI_Isend(this_msg_pattern, this_msg_pattern_size, MPI_CHAR, rank,
+                                    (int)Action::ReadRequest, MPI_COMM_WORLD, &req));
+                get_pending_mpi_requests().push_back(
+                    MPI_RequestBuffer{req, this_msg_pattern_buffer});
                 next_tag_request_number[rank] = (next_tag_request_number[rank] + 1) %
                                                 (std::numeric_limits<int>::max() / MaxAction);
             }
@@ -1382,18 +1400,19 @@ namespace anarchofs {
             }
 
             const auto &offsets = get_open_files_cache().at(file_id);
-            auto &pending_requests = get_pending_mpi_requests();
             for (unsigned int rank = 0; rank < get_num_procs(); ++rank) {
                 if (offsets[rank] == offsets[rank + 1]) continue;
-                std::string this_msg_pattern = std::string(sizeof(RequestNum) + sizeof(FileId), 0);
+                std::size_t this_msg_pattern_size = sizeof(RequestNum) + sizeof(FileId);
+                auto this_msg_pattern_buffer = std::shared_ptr<char>(
+                    new char[this_msg_pattern_size], std::default_delete<char[]>());
+                auto this_msg_pattern = this_msg_pattern_buffer.get();
                 set_request_num(first_req + rank, &this_msg_pattern[0]);
                 write_as_chars(file_id, &this_msg_pattern[sizeof(RequestNum)]);
-                pending_requests.resize(pending_requests.size() + 1);
-                auto &pending_request = pending_requests.back();
-                pending_request.buffer = std::make_shared<std::string>(std::move(this_msg_pattern));
-                check_mpi(MPI_Isend(pending_request.buffer->data(), pending_request.buffer->size(),
-                                    MPI_CHAR, rank, (int)Action::CloseRequest, MPI_COMM_WORLD,
-                                    &pending_request.request));
+                MPI_Request req;
+                check_mpi(MPI_Isend(this_msg_pattern, this_msg_pattern_size, MPI_CHAR, rank,
+                                    (int)Action::CloseRequest, MPI_COMM_WORLD, &req));
+                get_pending_mpi_requests().push_back(
+                    MPI_RequestBuffer{req, this_msg_pattern_buffer});
             }
 
             get_open_files_cache().erase(file_id);
@@ -1487,7 +1506,8 @@ namespace anarchofs {
                     if (pending_mpi_request_callbacks.size() > 0) {
                         log("checking pending MPI requests with callbacks\n");
                         pending_mpi_request_callbacks.erase(
-                            std::remove_if(pending_mpi_request_callbacks.begin(), pending_mpi_request_callbacks.end(),
+                            std::remove_if(pending_mpi_request_callbacks.begin(),
+                                           pending_mpi_request_callbacks.end(),
                                            [](MPI_RequestCallback &req_callback) {
                                                int flag;
                                                check_mpi(MPI_Test(&req_callback.request, &flag,
@@ -1567,7 +1587,7 @@ namespace anarchofs {
                     if (std::chrono::duration<double>(now - last_report).count() >
                         10 /* 5 mins */) {
                         detail::reportTimings(std::cout);
-			last_report = now;
+                        last_report = now;
                     }
 #    endif
 
