@@ -826,6 +826,61 @@ namespace anarchofs {
     ///
 
     namespace detail {
+
+#    ifdef AFS_DAEMON_USE_MPIIO
+	using FileHandle = MPI_File;
+
+        inline bool file_open(const char *filename, MPI_File&f) {
+            return MPI_File_open(MPI_COMM_SELF, filename, MPI_MODE_RDONLY, MPI_INFO_NULL, f) ==
+                   MPI_SUCCESS;
+        }
+
+        inline Offset get_file_size(MPI_File &f) {
+            MPI_Offset offset;
+            check_mpi(MPI_File_get_size(f, &offset));
+            return offset;
+        }
+
+        inline MPI_Request file_read(MPI_File &f, std::size_t offset, char *v, std::size_t n) {
+            MPI_Request req;
+            check_mpi(MPI_File_seek(f, offset, MPI_SEEK_SET));
+            check_mpi(MPI_File_iread(f, v, n, MPI_CHAR, &req));
+            return req;
+        }
+
+        inline void file_close(File_Requests &f) { check_mpi(MPI_File_close(&f)); }
+#    else
+        using FileHandle = std::FILE *;
+
+        inline bool file_open(const char *filename, std::FILE *&f) {
+            f = std::fopen(filename, "r");
+            return f != NULL;
+        }
+
+        inline Offset get_file_size(std::FILE *f) {
+            // Get the current size of the file
+            off_t end_of_file;
+            if (std::fseek(f, -1, SEEK_END) != 0)
+                throw std::runtime_error("Error setting file position");
+
+            if ((end_of_file = std::ftell(f) + 1) == 0)
+                throw std::runtime_error("Error getting file position");
+
+            Offset curr_size = end_of_file;
+            return curr_size;
+        }
+
+        inline void file_read(std::FILE *f, std::size_t offset, char *v, std::size_t n) {
+            if (std::fseek(f, offset, SEEK_SET) == 0) {
+                std::size_t count = std::fread(v, sizeof(char), n, f);
+                if (count == n) return;
+            }
+            throw std::runtime_error("file_read: error while reading");
+        }
+
+        inline void file_close(std::FILE *f) { std::fclose(f); }
+#    endif
+
         using FileInfo = std::vector<Offset>; ///< First offset on each node
 
         using OpenFilesCache = std::unordered_map<FileId, FileInfo>;
@@ -857,7 +912,7 @@ namespace anarchofs {
             /// From path to file handler
             /// From path to counts
             struct HandlerAndCount {
-                std::FILE *f;
+                FileHandle f;
                 unsigned int count;
             };
             std::unordered_map<std::string, HandlerAndCount> from_path_to_handler_and_count;
@@ -866,7 +921,7 @@ namespace anarchofs {
             /// From file id to file handler
             struct PathAndHandler {
                 std::string path;
-                std::FILE *f;
+                FileHandle f;
             };
             std::unordered_map<FromAndFileId, PathAndHandler, HashForFromAndFileId>
                 from_file_id_to_path_and_handler;
@@ -874,12 +929,10 @@ namespace anarchofs {
             LocalOpenedFiles()
                 : from_path_to_handler_and_count(16), from_file_id_to_path_and_handler(16) {}
 
-            std::FILE *open(const char *path, const FromAndFileId &file_id) {
+            bool open(const char *path, const FromAndFileId &file_id, FileHandle &f) {
                 std::string path_s(path);
-                std::FILE *f;
                 if (from_path_to_handler_and_count.count(path) == 0) {
-                    f = std::fopen(path, "r");
-                    if (f == NULL) return NULL;
+                    if (!file_open(path, f)) return false;
                     from_path_to_handler_and_count[path_s] = {f, 1};
                 } else {
                     auto &handler_and_count = from_path_to_handler_and_count[path_s];
@@ -887,12 +940,13 @@ namespace anarchofs {
                     handler_and_count.count++;
                 }
                 from_file_id_to_path_and_handler[file_id] = {path_s, f};
-                return f;
+                return true;
             }
 
-            std::FILE *get_file_handler(const FromAndFileId &file_id) {
-                if (from_file_id_to_path_and_handler.count(file_id) == 0) return NULL;
-                return from_file_id_to_path_and_handler.at(file_id).f;
+            bool get_file_handler(const FromAndFileId &file_id, FileHandle &f) {
+                if (from_file_id_to_path_and_handler.count(file_id) == 0) return false;
+                f = from_file_id_to_path_and_handler.at(file_id).f;
+                return true;
             }
 
             bool close(const FromAndFileId &file_id) {
@@ -900,7 +954,7 @@ namespace anarchofs {
                 auto path_and_handler = from_file_id_to_path_and_handler.at(file_id);
                 auto handler_and_count = from_path_to_handler_and_count.at(path_and_handler.path);
                 if (handler_and_count.count == 1) {
-                    std::fclose(handler_and_count.f);
+                    file_close(handler_and_count.f);
                     from_path_to_handler_and_count.erase(path_and_handler.path);
                 } else {
                     from_path_to_handler_and_count.at(path_and_handler.path).count--;
@@ -952,20 +1006,6 @@ namespace anarchofs {
                 return pending;
             }
 
-            inline Offset get_file_size(std::FILE *f) {
-                // Get the current size of the file
-                off_t end_of_file;
-                if (std::fseek(f, -1, SEEK_END) != 0)
-                    throw std::runtime_error("Error setting file position");
-
-                if ((end_of_file = std::ftell(f) + 1) == 0)
-                    throw std::runtime_error("Error getting file position");
-                log("getting file size %d\n", (int)end_of_file);
-
-                Offset curr_size = end_of_file;
-                return curr_size;
-            }
-
             inline void response_global_open_file_request(int rank, int message_size) {
 		tracker t_("open file processing requests");
 
@@ -984,10 +1024,11 @@ namespace anarchofs {
                 std::string response(sizeof(RequestNum) + sizeof(Offset), 0);
                 set_request_num(request_num, &response[0]);
 
-                std::FILE *f =
-                    get_local_opened_files().open(path_hack.c_str(), FromAndFileId{rank, file_id});
+                FileHandle f;
+                bool success = get_local_opened_files().open(path_hack.c_str(),
+                                                             FromAndFileId{rank, file_id}, f);
                 Offset file_size_plus_one = 0;
-                if (f != NULL) file_size_plus_one = get_file_size(f) + 1;
+                if (success) file_size_plus_one = get_file_size(f) + 1;
                 write_as_chars(file_size_plus_one, &response[sizeof(RequestNum)]);
 
                 auto &pending_requests = get_pending_mpi_requests();
@@ -1156,26 +1197,19 @@ namespace anarchofs {
 
                 std::string response(local_size, 0);
 
-                Offset count = 0;
-                {
-                    tracker t_("read file processing requests (fread)");
-                    std::FILE *f =
-                        get_local_opened_files().get_file_handler(FromAndFileId{rank, file_id});
-                    if (f == NULL)
-                        throw std::runtime_error("response_read_request: file_id is not a valid");
-                    if (std::fseek(f, local_offset, SEEK_SET) == 0) {
-                        count = std::fread(&response[0], sizeof(char), local_size, f);
-                    }
-                    if (count != local_size)
-                        throw std::runtime_error("response_read_request: error while reading");
-                }
+                tracker t0_("read file processing requests (fread)");
+                FileHandle f;
+                if (!get_local_opened_files().get_file_handler(FromAndFileId{rank, file_id}, f))
+                    throw std::runtime_error("response_read_request: file_id is not a valid");
+                file_read(f, local_offset, &response[0], local_size);
+                t0_.stop();
 
                 auto &pending_requests = get_pending_mpi_requests();
                 pending_requests.resize(pending_requests.size() + 1);
                 auto &pending_request = pending_requests.back();
                 pending_request.buffer = std::make_shared<std::string>(std::move(response));
-                tracker t0_("read file processing requests (MPI_Isend)");
-                check_mpi(MPI_Isend(pending_request.buffer->data(), count, MPI_CHAR, rank,
+                tracker t1_("read file processing requests (MPI_Isend)");
+                check_mpi(MPI_Isend(pending_request.buffer->data(), local_size, MPI_CHAR, rank,
                                     (int)Action::ReadAnswer + (int)request_num * MaxAction,
                                     MPI_COMM_WORLD, &pending_request.request));
             }
