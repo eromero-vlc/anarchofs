@@ -5,8 +5,16 @@ ifeq ($(AFS_WITH_FUSE), yes)
   LIBS_FUSE ?= $(shell pkg-config fuse3 --libs )
 endif
 
+ifeq ($(AFS_WITH_MPIIO), yes)
+  CXXFLAGS_MPIIO ?= -DAFS_DAEMON_USE_MPIIO
+endif
+
+ifeq ($(AFS_WITH_TRACK_TIME), yes)
+  CXXFLAGS_TRACK ?= -DAFS_DAEMON_TRACK_TIME
+endif
+
 anarchofs: anarchofs.cc anarchofs_lib.h Makefile
-	${CXX} ${CXXFLAGS} ${CXXFLAGS_FUSE} anarchofs.cc ${LIBS_FUSE} -lpthread -o anarchofs
+	${CXX} ${CXXFLAGS} ${CXXFLAGS_FUSE} ${CXXFLAGS_MPIIO} ${CXXFLAGS_TRACK} anarchofs.cc ${LIBS_FUSE} -lpthread -o anarchofs
 
 test_socket: test_socket.cc anarchofs_lib.h Makefile
 	${CXX} ${CXXFLAGS} test_socket.cc -o test_socket
