@@ -202,6 +202,7 @@ namespace anarchofs {
             }
 #    else
             tracker(const std::string &) {}
+            void stop() {}
 #    endif
 
             // Forbid copy constructor and assignment operator
@@ -837,13 +838,14 @@ namespace anarchofs {
                    MPI_SUCCESS;
         }
 
-        inline Offset get_file_size(MPI_File &f) {
+        inline Offset get_file_size(const MPI_File &f) {
             MPI_Offset offset;
             check_mpi(MPI_File_get_size(f, &offset));
             return offset;
         }
 
-        inline MPI_Request file_read(MPI_File &f, std::size_t offset, char *v, std::size_t n) {
+        inline MPI_Request file_read(const MPI_File &f, std::size_t offset, char *v,
+                                     std::size_t n) {
             MPI_Request req;
             check_mpi(MPI_File_seek(f, offset, MPI_SEEK_SET));
             check_mpi(MPI_File_iread(f, v, n, MPI_CHAR, &req));
