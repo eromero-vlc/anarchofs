@@ -1164,7 +1164,7 @@ namespace anarchofs {
                     if (f == NULL)
                         throw std::runtime_error("response_read_request: file_id is not a valid");
                     if (std::fseek(f, local_offset, SEEK_SET) == 0) {
-                        count = std::fread(&response[sizeof(RequestNum)], 1, local_size, f);
+                        count = std::fread(&response[0], sizeof(char), local_size, f);
                     }
                     if (count != local_size)
                         throw std::runtime_error("response_read_request: error while reading");
