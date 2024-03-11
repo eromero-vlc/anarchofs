@@ -63,6 +63,7 @@
 #include <dirent.h>
 #include <functional>
 #include <iomanip>
+#include <iostream>
 #include <memory>
 #include <mutex>
 #include <set>
