@@ -111,9 +111,9 @@ namespace anarchofs {
             return t;
         }
 
-#ifdef ANARCOFS_LOG
         inline unsigned int &get_proc_id();
 
+#ifdef ANARCOFS_LOG
         template <typename... Args> void log(const char *s, Args... args) {
 #    ifdef AFS_DAEMON_USE_FUSE
             fuse_log(FUSE_LOG_DEBUG, s, args...);
@@ -137,6 +137,16 @@ namespace anarchofs {
         template <typename... Args> void log(const char *, Args...) {}
         template <typename... Args> void warning(const char *, Args...) {}
 #endif
+
+        template <typename... Args> void show_error(const char *s, Args... args) {
+#ifdef AFS_DAEMON_USE_FUSE
+            fuse_log(FUSE_LOG_DEBUG, s, args...);
+#else
+            printf("[%d] error: ", get_proc_id());
+            printf(s, args...);
+            fflush(stdout);
+#endif
+        }
     }
 
 #ifdef BUILD_AFS_DAEMON
@@ -970,7 +980,9 @@ namespace anarchofs {
 
         /// Execute a callback only after a number of calls
 
-        struct TickingCallback {
+        enum class QueueCallback { DoQueueCallback, DontQueueCallback };
+
+        template <QueueCallback queue_callback> struct TickingCallback {
             /// Actual callback to execute
             std::shared_ptr<std::function<void()>> callback;
 
@@ -983,8 +995,12 @@ namespace anarchofs {
             void call() {
                 // If there is only one reference, queue the callback
                 if (callback.use_count() == 1) {
-                    std::function<void()> f = *callback;
-                    get_func_buffer().push_back([=]() { f(); });
+                    if (queue_callback == QueueCallback::DoQueueCallback) {
+                        std::function<void()> f = *callback;
+                        get_func_buffer().push_back([=]() { f(); });
+                    } else {
+                        (*callback)();
+                    }
                 }
                 callback.reset();
             }
@@ -998,7 +1014,7 @@ namespace anarchofs {
         namespace detail_open_file {
             struct SizeAndCallback {
                 std::size_t size;
-                TickingCallback callback;
+                TickingCallback<QueueCallback::DoQueueCallback> callback;
             };
 
             /// Get open file pending transactions
@@ -1092,7 +1108,7 @@ namespace anarchofs {
             detail::tracker t_("open file sending requests");
 
             // Prepare the responses
-            TickingCallback callback(process);
+            TickingCallback<QueueCallback::DoQueueCallback> callback(process);
             for (unsigned int rank = 0; rank < get_num_procs(); ++rank)
                 get_open_file_pending_transactions().emplace(
                     std::make_pair(first_req + rank, SizeAndCallback{0, callback}));
@@ -1171,8 +1187,9 @@ namespace anarchofs {
 
     namespace detail {
         struct MPI_RequestCallback {
-            MPI_Request request;      ///< MPI request handler
-            TickingCallback callback; ///< callback associated to the request
+            MPI_Request request; ///< MPI request handler
+            TickingCallback<QueueCallback::DontQueueCallback>
+                callback; ///< callback associated to the request
         };
 
         /// Return the list of pending requests
@@ -1210,7 +1227,7 @@ namespace anarchofs {
 #    ifdef AFS_DAEMON_USE_MPIIO
                 MPI_Request req = file_read(f, local_offset, response_buffer.get(), local_size);
                 get_pending_mpi_request_callbacks().push_back(MPI_RequestCallback{
-                    req, TickingCallback([=]() {
+                    req, TickingCallback<QueueCallback::DontQueueCallback>([=]() {
                         tracker t_("read file processing requests (MPI_Isend)");
                         MPI_Request req;
                         check_mpi(MPI_Isend(response_buffer.get(), local_size, MPI_CHAR, rank,
@@ -1279,7 +1296,7 @@ namespace anarchofs {
             std::vector<Offset> local_counts(get_num_procs());
             std::vector<Offset> str_offsets(get_num_procs());
             const auto &offsets = get_open_files_cache().at(file_id);
-            TickingCallback callback(process);
+            TickingCallback<QueueCallback::DontQueueCallback> callback(process);
             for (unsigned int rank = 0; rank < get_num_procs(); ++rank) {
                 Offset first_element = std::max(offsets[rank], std::min(offsets[rank + 1], offset));
                 Offset last_element =
@@ -1327,6 +1344,7 @@ namespace anarchofs {
         const auto process = [=]() {
             log("mpi read (process) request: %d\n", (int)first_req);
 
+            detail::tracker t_("read file finalizing requests");
             response_callback(count);
         };
 
@@ -1491,6 +1509,7 @@ namespace anarchofs {
                     auto &pending_mpi_requests = get_pending_mpi_requests();
                     if (pending_mpi_requests.size() > 0) {
                         log("checking pending MPI requests\n");
+                        tracker t_("checking pending MPI requests");
                         pending_mpi_requests.erase(
                             std::remove_if(pending_mpi_requests.begin(), pending_mpi_requests.end(),
                                            [](MPI_RequestBuffer &req_buffer) {
@@ -1507,6 +1526,7 @@ namespace anarchofs {
                     auto &pending_mpi_request_callbacks = get_pending_mpi_request_callbacks();
                     if (pending_mpi_request_callbacks.size() > 0) {
                         log("checking pending MPI requests with callbacks\n");
+                        tracker t_("checking pending MPI requests with callbacks");
                         pending_mpi_request_callbacks.erase(
                             std::remove_if(pending_mpi_request_callbacks.begin(),
                                            pending_mpi_request_callbacks.end(),
@@ -1524,64 +1544,70 @@ namespace anarchofs {
                         something_done = true;
                     }
 
-                    MPI_Status status;
-                    int flag;
-                    check_mpi(
-                        MPI_Iprobe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &flag, &status));
-                    if (flag != 0) {
-                        Action action = (Action)(status.MPI_TAG % MaxAction);
-                        int origin = status.MPI_SOURCE;
-                        int message_size;
-                        check_mpi(MPI_Get_count(&status, MPI_CHAR, &message_size));
-                        log("got a message from %d\n", origin);
-                        switch (action) {
-                        case Action::GetFileStatusRequest:
-                            detail_get_file_status::response_file_status_request(origin,
-                                                                                 message_size);
-                            break;
+                    {
+                        tracker t_("processing MPI messages");
+                        MPI_Status status;
+                        int flag;
+                        check_mpi(MPI_Iprobe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &flag,
+                                             &status));
+                        if (flag != 0) {
+                            Action action = (Action)(status.MPI_TAG % MaxAction);
+                            int origin = status.MPI_SOURCE;
+                            int message_size;
+                            check_mpi(MPI_Get_count(&status, MPI_CHAR, &message_size));
+                            log("got a message from %d\n", origin);
+                            switch (action) {
+                            case Action::GetFileStatusRequest:
+                                detail_get_file_status::response_file_status_request(origin,
+                                                                                     message_size);
+                                break;
 
-                        case Action::GetFileStatusAnswer:
-                            detail_get_file_status::response_file_status_answer(origin,
-                                                                                message_size);
-                            break;
+                            case Action::GetFileStatusAnswer:
+                                detail_get_file_status::response_file_status_answer(origin,
+                                                                                    message_size);
+                                break;
 
-                        case Action::GlobalOpenRequest:
-                            detail_open_file::response_global_open_file_request(origin,
-                                                                                message_size);
-                            break;
+                            case Action::GlobalOpenRequest:
+                                detail_open_file::response_global_open_file_request(origin,
+                                                                                    message_size);
+                                break;
 
-                        case Action::GlobalOpenAnswer:
-                            detail_open_file::response_global_open_file_answer(origin,
-                                                                               message_size);
-                            break;
+                            case Action::GlobalOpenAnswer:
+                                detail_open_file::response_global_open_file_answer(origin,
+                                                                                   message_size);
+                                break;
 
-                        case Action::GetDirectoryListRequest:
-                            detail_get_directory_list::response_get_directory_list_request(
-                                origin, message_size);
-                            break;
+                            case Action::GetDirectoryListRequest:
+                                detail_get_directory_list::response_get_directory_list_request(
+                                    origin, message_size);
+                                break;
 
-                        case Action::GetDirectoryListAnswer:
-                            detail_get_directory_list::response_get_directory_list_answer(
-                                origin, message_size);
-                            break;
+                            case Action::GetDirectoryListAnswer:
+                                detail_get_directory_list::response_get_directory_list_answer(
+                                    origin, message_size);
+                                break;
 
-                        case Action::ReadRequest:
-                            detail_read::response_read_request(origin, message_size);
-                            break;
+                            case Action::ReadRequest:
+                                detail_read::response_read_request(origin, message_size);
+                                break;
 
-                        case Action::CloseRequest:
-                            detail_close::response_close_request(origin, message_size);
-                            break;
+                            case Action::CloseRequest:
+                                detail_close::response_close_request(origin, message_size);
+                                break;
 
-                        default: throw std::runtime_error("unexpected action code"); break;
+                            default: throw std::runtime_error("unexpected action code"); break;
+                            }
+                            something_done = true;
                         }
-                        something_done = true;
                     }
 
-                    while (buffer.size() > 0) {
-                        log("pending function to execute\n");
-                        buffer.pop_front()();
-                        something_done = true;
+                    {
+                        tracker t_("do pending tasks");
+                        while (buffer.size() > 0) {
+                            log("pending function to execute\n");
+                            buffer.pop_front()();
+                            something_done = true;
+                        }
                     }
 
 #    ifdef AFS_DAEMON_TRACK_TIME
@@ -1596,7 +1622,7 @@ namespace anarchofs {
                     if (!something_done) std::this_thread::yield();
                 }
             } catch (const std::exception &e) {
-                warning("Error happened in `anarchofs::mpi_loop`: %s\n", e.what());
+                show_error("Error happened in `anarchofs::mpi_loop`: %s\n", e.what());
             }
 
             // Finalize MPI
@@ -1620,7 +1646,7 @@ namespace anarchofs {
             while (!is_mpi_initialized()) std::this_thread::yield();
             return true;
         } catch (const std::exception &e) {
-            warning("Error happened in `anarchofs::start_mpi_loop`: %s\n", e.what());
+            show_error("Error happened in `anarchofs::start_mpi_loop`: %s\n", e.what());
             return false;
         }
     }
@@ -1636,7 +1662,7 @@ namespace anarchofs {
             log("MPI loop stopped\n");
             return true;
         } catch (const std::exception &e) {
-            warning("Error happened in `anarchofs::stop_mpi_loop`: %s\n", e.what());
+            show_error("Error happened in `anarchofs::stop_mpi_loop`: %s\n", e.what());
             return false;
         }
     }
@@ -1687,12 +1713,29 @@ namespace anarchofs {
             }
 
             inline bool read_from_socket(int socket, void *v, std::size_t size) {
+#ifdef BUILD_AFS_DAEMON
+                anarchofs::detail::tracker t_("read_from_socket");
+#endif
                 std::size_t total_read = 0;
                 while (total_read < size) {
                     ssize_t count =
                         ::read(socket, (void *)((char *)v + total_read), size - total_read);
                     if (count <= 0) return false;
                     total_read += (std::size_t)count;
+                }
+                return true;
+            }
+
+            inline bool write_into_socket(int socket, const void *v, std::size_t size) {
+#ifdef BUILD_AFS_DAEMON
+                anarchofs::detail::tracker t_("write_into_socket");
+#endif
+                std::size_t total_written = 0;
+                while (total_written < size) {
+                    ssize_t count = ::write(socket, (void *)((const char *)v + total_written),
+                                            size - total_written);
+                    if (count <= 0) return false;
+                    total_written += (std::size_t)count;
                 }
                 return true;
             }
@@ -1759,7 +1802,7 @@ namespace anarchofs {
                         get_opened_files_by_sockets().at(socket).insert(file_id);
 
                         // Return back the file id
-                        if (write(socket, (const void *)&file_id, sizeof(FileId)) != sizeof(FileId))
+                        if (!write_into_socket(socket, (const void *)&file_id, sizeof(FileId)))
                             warning("process_socket_action: error writing on socket\n");
                     });
                     break;
@@ -1790,8 +1833,7 @@ namespace anarchofs {
                              if (size_or_error > (std::int64_t)size)
                                  throw std::runtime_error(
                                      "process_socket_action: got invalid `size_or_error`");
-                             if (write(socket, read_buffer->data(), chars_to_write) !=
-                                 chars_to_write)
+                             if (!write_into_socket(socket, read_buffer->data(), chars_to_write))
                                  warning("process_socket_action: error writing on socket\n");
                          });
                     break;
@@ -1817,7 +1859,7 @@ namespace anarchofs {
                             success ? 0 : 1);
                         // Return back whether the action was successful
                         std::uint32_t r = (success ? 0 : 1);
-                        if (write(socket, (const void *)&r, sizeof(r)) != sizeof(r))
+                        if (!write_into_socket(socket, (const void *)&r, sizeof(r)))
                             warning("process_socket_action: error writing on socket\n");
                     });
                     break;
@@ -1934,7 +1976,7 @@ namespace anarchofs {
                         }
                     }
                 } catch (const std::exception &e) {
-                    anarchofs::detail::warning(
+                    anarchofs::detail::show_error(
                         "Error happened in `anarchofs::server::socket_loop`: %s\n", e.what());
                 }
             }
@@ -1956,7 +1998,7 @@ namespace anarchofs {
                 }
                 return true;
             } catch (const std::exception &e) {
-                anarchofs::detail::warning(
+                anarchofs::detail::show_error(
                     "Error happened in `anarchofs::server::start_socket_loop`: %s\n", e.what());
                 return false;
             }
@@ -1973,7 +2015,7 @@ namespace anarchofs {
                 anarchofs::detail::log("socket loop stopped\n");
                 return true;
             } catch (const std::exception &e) {
-                anarchofs::detail::warning(
+                anarchofs::detail::show_error(
                     "Error happened in `anarchofs::server::stop_socket_loop`: %s\n", e.what());
                 return false;
             }
@@ -2029,7 +2071,8 @@ namespace anarchofs {
             anarchofs::detail::write_as_chars((std::uint32_t)filename_size,
                                               buffer.data() + sizeof(std::uint32_t));
             std::copy_n(filename, filename_size, buffer.data() + sizeof(std::uint32_t) * 2);
-            if (write(detail::get_socket(), buffer.data(), buffer.size()) != (ssize_t)buffer.size())
+            if (!server::detail::write_into_socket(detail::get_socket(), buffer.data(),
+                                                   buffer.size()))
                 throw std::runtime_error("error writing to socket");
 
             FileId file_id;
@@ -2065,7 +2108,8 @@ namespace anarchofs {
             anarchofs::detail::write_as_chars((std::size_t)n,
                                               buffer.data() + sizeof(std::uint32_t) +
                                                   sizeof(FileId) + sizeof(std::size_t));
-            if (write(detail::get_socket(), buffer.data(), buffer.size()) != (ssize_t)buffer.size())
+            if (!server::detail::write_into_socket(detail::get_socket(), buffer.data(),
+                                                   buffer.size()))
                 throw std::runtime_error("error writing to socket");
 
             // Process answer
@@ -2093,7 +2137,8 @@ namespace anarchofs {
             anarchofs::detail::write_as_chars((std::uint32_t)server::detail::Action::CloseRequest,
                                               buffer.data());
             anarchofs::detail::write_as_chars(f->file_id, buffer.data() + sizeof(std::uint32_t));
-            if (write(detail::get_socket(), buffer.data(), buffer.size()) != (ssize_t)buffer.size())
+            if (!server::detail::write_into_socket(detail::get_socket(), buffer.data(),
+                                                   buffer.size()))
                 throw std::runtime_error("error writing to socket");
 
             std::uint32_t response = 0;
