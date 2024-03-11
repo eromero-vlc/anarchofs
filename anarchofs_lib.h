@@ -319,7 +319,7 @@ namespace anarchofs {
 
         using Func = std::function<void()>;
         inline Buffer<Func> &get_func_buffer() {
-            static Buffer<Func> buffer(1024);
+            static Buffer<Func> buffer(1024 * 16);
             return buffer;
         }
 
@@ -448,16 +448,16 @@ namespace anarchofs {
         /// Replace "@NPROC" by the process id in the given string; used for debugging
         /// \param path: given string
 
-        inline std::string replace_hack(const char *path) {
+        inline std::string replace_hack(const std::string &path) {
             int this_proc = get_proc_id();
             std::string::size_type n = 0;
-            std::string path_s(path);
             std::string re("@NPROC");
             std::string this_proc_s = std::to_string(this_proc);
-            while ((n = path_s.find(re)) != std::string::npos) {
-                path_s.replace(n, re.size(), this_proc_s);
+            std::string path_out = path;
+            while ((n = path_out.find(re)) != std::string::npos) {
+                path_out.replace(n, re.size(), this_proc_s);
             }
-            return path_s;
+            return path_out;
         }
 
         /// Type of the request numbers
@@ -556,14 +556,10 @@ namespace anarchofs {
                 return pending;
             }
 
-            inline void response_file_status_request(int rank, int message_size) {
-                std::vector<char> buffer(message_size + 1);
-                MPI_Status status;
-                check_mpi(MPI_Recv(buffer.data(), message_size, MPI_CHAR, rank,
-                                   (int)Action::GetFileStatusRequest, MPI_COMM_WORLD, &status));
-                RequestNum request_num = get_request_num(buffer.data());
-                const char *path = buffer.data() + sizeof(RequestNum);
-                buffer[message_size] = 0; // make path a null-terminate string
+            inline void response_file_status_request(int rank, const char *buffer,
+                                                     int message_size) {
+                RequestNum request_num = get_request_num(buffer);
+                std::string path(buffer + sizeof(RequestNum), buffer + message_size);
                 std::string path_hack = replace_hack(path);
                 log("getting requesting get_file_status from %d: %s\n", rank, path_hack.c_str());
 
@@ -598,16 +594,13 @@ namespace anarchofs {
                 get_pending_mpi_requests().push_back(MPI_RequestBuffer{req, response_buffer});
             }
 
-            inline void response_file_status_answer(int rank, int message_size) {
+            inline void response_file_status_answer(int rank, const char *buffer,
+                                                    int message_size) {
                 assert(message_size == sizeof(RequestNum) + sizeof(FileType) + sizeof(Offset));
-                std::vector<char> buffer(message_size);
-                MPI_Status status;
-                check_mpi(MPI_Recv(buffer.data(), message_size, MPI_CHAR, rank,
-                                   (int)Action::GetFileStatusAnswer, MPI_COMM_WORLD, &status));
-                RequestNum request_num = get_request_num(buffer.data());
-                FileType file_type = read_from_chars<FileType>(buffer.data() + sizeof(RequestNum));
+                RequestNum request_num = get_request_num(buffer);
+                FileType file_type = read_from_chars<FileType>(buffer + sizeof(RequestNum));
                 Offset file_size =
-                    read_from_chars<Offset>(buffer.data() + sizeof(RequestNum) + sizeof(FileType));
+                    read_from_chars<Offset>(buffer + sizeof(RequestNum) + sizeof(FileType));
                 std::unique_lock<std::mutex> unique_lock(
                     get_file_status_pending_transactions_mutex());
                 get_file_status_pending_transactions()
@@ -700,15 +693,11 @@ namespace anarchofs {
                 return pending;
             }
 
-            inline void response_get_directory_list_request(int rank, int message_size) {
-                std::vector<char> buffer(message_size + 1);
-                MPI_Status status;
-                check_mpi(MPI_Recv(buffer.data(), message_size, MPI_CHAR, rank,
-                                   (int)Action::GetDirectoryListRequest, MPI_COMM_WORLD, &status));
-                RequestNum request_num = get_request_num(buffer.data());
-                const char *path = buffer.data() + sizeof(RequestNum);
-                buffer[message_size] = 0; // make path a null-terminate string
-                log("getting requesting get_directory_list from %d: %s\n", rank, path);
+            inline void response_get_directory_list_request(int rank, const char *buffer,
+                                                            int message_size) {
+                RequestNum request_num = get_request_num(buffer);
+                std::string path(buffer, buffer + message_size);
+                log("getting requesting get_directory_list from %d: %s\n", rank, path.c_str());
 
                 std::vector<char> response(sizeof(RequestNum));
                 set_request_num(request_num, response.data());
@@ -746,15 +735,12 @@ namespace anarchofs {
                 get_pending_mpi_requests().push_back(MPI_RequestBuffer{req, response_buffer});
             }
 
-            inline void response_get_directory_list_answer(int rank, int message_size) {
-                std::vector<char> buffer(message_size);
-                MPI_Status status;
-                check_mpi(MPI_Recv(buffer.data(), message_size, MPI_CHAR, rank,
-                                   (int)Action::GetDirectoryListAnswer, MPI_COMM_WORLD, &status));
-                RequestNum request_num = get_request_num(buffer.data());
-                const char *msg_it = buffer.data() + sizeof(RequestNum);
+            inline void response_get_directory_list_answer(int rank, const char *buffer,
+                                                           int message_size) {
+                RequestNum request_num = get_request_num(buffer);
+                const char *msg_it = buffer + sizeof(RequestNum);
                 std::vector<FilenameType> response;
-                for (const char *msg_end = buffer.data() + buffer.size(); msg_it != msg_end;) {
+                for (const char *msg_end = buffer + message_size; msg_it != msg_end;) {
                     // Get type
                     FileType type = (FileType)*msg_it++;
                     // Get name
@@ -1027,17 +1013,14 @@ namespace anarchofs {
                 return pending;
             }
 
-            inline void response_global_open_file_request(int rank, int message_size) {
+            inline void response_global_open_file_request(int rank, const char *buffer,
+                                                          int message_size) {
                 tracker t_("open file processing requests");
 
-                std::vector<char> buffer(message_size + 1);
-                MPI_Status status;
-                check_mpi(MPI_Recv(buffer.data(), message_size, MPI_CHAR, rank,
-                                   (int)Action::GlobalOpenRequest, MPI_COMM_WORLD, &status));
-                RequestNum request_num = get_request_num(buffer.data());
-                FileId file_id = read_from_chars<FileId>(buffer.data() + sizeof(RequestNum));
-                const char *path = buffer.data() + sizeof(RequestNum) + sizeof(FileId);
-                buffer[message_size] = 0; // make path a null-terminate string
+                RequestNum request_num = get_request_num(buffer);
+                FileId file_id = read_from_chars<FileId>(buffer + sizeof(RequestNum));
+                std::string path(buffer + sizeof(RequestNum) + sizeof(FileId),
+                                 buffer + message_size);
                 std::string path_hack = replace_hack(path);
                 log("mpi open id: %d process response from: %d: file: %s\n", (int)file_id, rank,
                     path_hack.c_str());
@@ -1062,15 +1045,12 @@ namespace anarchofs {
                 get_pending_mpi_requests().push_back(MPI_RequestBuffer{req, response_buffer});
             }
 
-            inline void response_global_open_file_answer(int rank, int message_size) {
+            inline void response_global_open_file_answer(int rank, const char *buffer,
+                                                         int message_size) {
                 tracker t_("open file processing answers");
 
-                std::vector<char> buffer(message_size);
-                MPI_Status status;
-                check_mpi(MPI_Recv(buffer.data(), message_size, MPI_CHAR, rank,
-                                   (int)Action::GlobalOpenAnswer, MPI_COMM_WORLD, &status));
-                RequestNum request_num = get_request_num(buffer.data());
-                const char *msg_it = buffer.data() + sizeof(RequestNum);
+                RequestNum request_num = get_request_num(buffer);
+                const char *msg_it = buffer + sizeof(RequestNum);
                 Offset file_size_plus_one = read_from_chars<Offset>(msg_it);
                 auto &size_and_callback = get_open_file_pending_transactions().at(request_num);
                 size_and_callback.size = file_size_plus_one;
@@ -1202,18 +1182,14 @@ namespace anarchofs {
         }
 
         namespace detail_read {
-            inline void response_read_request(int rank, int message_size) {
+            inline void response_read_request(int rank, const char *buffer, int message_size) {
                 tracker t_("read file processing requests");
 
-                std::vector<char> buffer(message_size);
-                MPI_Status status;
-                check_mpi(MPI_Recv(buffer.data(), message_size, MPI_CHAR, rank,
-                                   (int)Action::ReadRequest, MPI_COMM_WORLD, &status));
-                RequestNum request_num = get_request_num(buffer.data());
-                FileId file_id = read_from_chars<FileId>(buffer.data() + sizeof(RequestNum));
+                RequestNum request_num = get_request_num(buffer);
+                FileId file_id = read_from_chars<FileId>(buffer + sizeof(RequestNum));
                 Offset local_offset =
-                    read_from_chars<Offset>(buffer.data() + sizeof(RequestNum) + sizeof(FileId));
-                Offset local_size = read_from_chars<Offset>(buffer.data() + sizeof(RequestNum) +
+                    read_from_chars<Offset>(buffer + sizeof(RequestNum) + sizeof(FileId));
+                Offset local_size = read_from_chars<Offset>(buffer + sizeof(RequestNum) +
                                                             sizeof(FileId) + sizeof(Offset));
                 log("mpi read request: %d id: %d from: %d size: %d\n", (int)request_num,
                     (int)file_id, (int)local_offset, (int)local_size);
@@ -1378,15 +1354,11 @@ namespace anarchofs {
 
     namespace detail {
         namespace detail_close {
-            inline void response_close_request(int rank, int message_size) {
+            inline void response_close_request(int rank, const char *buffer, int message_size) {
                 assert(message_size == sizeof(RequestNum) + sizeof(FileId));
-                std::vector<char> buffer(message_size);
-                MPI_Status status;
-                check_mpi(MPI_Recv(buffer.data(), message_size, MPI_CHAR, rank,
-                                   (int)Action::CloseRequest, MPI_COMM_WORLD, &status));
-                RequestNum request_num = get_request_num(buffer.data());
+                RequestNum request_num = get_request_num(buffer);
                 (void)request_num;
-                FileId file_id = read_from_chars<FileId>(buffer.data() + sizeof(RequestNum));
+                FileId file_id = read_from_chars<FileId>(buffer + sizeof(RequestNum));
                 log("mpi close (request) id: %d\n", (int)file_id);
 
                 if (!get_local_opened_files().close(FromAndFileId{rank, file_id}))
@@ -1503,6 +1475,7 @@ namespace anarchofs {
 #    endif
 
                 auto &buffer = get_func_buffer();
+                std::vector<char> msg_buffer;
                 while (!get_finalize_mpi_thread()) {
                     bool something_done = false;
 
@@ -1547,53 +1520,66 @@ namespace anarchofs {
 
                     {
                         tracker t_("processing MPI messages");
+                        MPI_Message msg;
                         MPI_Status status;
                         int flag;
-                        check_mpi(MPI_Iprobe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &flag,
-                                             &status));
+                        {
+                            tracker t_("processing MPI messages (MPI_Iprobe)");
+                            check_mpi(MPI_Improbe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD,
+                                                  &flag, &msg, &status));
+                        }
                         if (flag != 0) {
-                            Action action = (Action)(status.MPI_TAG % MaxAction);
                             int origin = status.MPI_SOURCE;
                             int message_size;
+                            Action action = (Action)(status.MPI_TAG % MaxAction);
                             check_mpi(MPI_Get_count(&status, MPI_CHAR, &message_size));
+                            if (msg_buffer.size() < (std::size_t)message_size)
+                                msg_buffer.resize(message_size);
+                            {
+                                tracker t_("processing MPI messages (MPI_Mrecv)");
+                                check_mpi(MPI_Mrecv(msg_buffer.data(), message_size, MPI_CHAR, &msg,
+                                                    MPI_STATUS_IGNORE));
+                            }
                             log("got a message from %d\n", origin);
                             switch (action) {
                             case Action::GetFileStatusRequest:
-                                detail_get_file_status::response_file_status_request(origin,
-                                                                                     message_size);
+                                detail_get_file_status::response_file_status_request(
+                                    origin, msg_buffer.data(), message_size);
                                 break;
 
                             case Action::GetFileStatusAnswer:
-                                detail_get_file_status::response_file_status_answer(origin,
-                                                                                    message_size);
+                                detail_get_file_status::response_file_status_answer(
+                                    origin, msg_buffer.data(), message_size);
                                 break;
 
                             case Action::GlobalOpenRequest:
-                                detail_open_file::response_global_open_file_request(origin,
-                                                                                    message_size);
+                                detail_open_file::response_global_open_file_request(
+                                    origin, msg_buffer.data(), message_size);
                                 break;
 
                             case Action::GlobalOpenAnswer:
-                                detail_open_file::response_global_open_file_answer(origin,
-                                                                                   message_size);
+                                detail_open_file::response_global_open_file_answer(
+                                    origin, msg_buffer.data(), message_size);
                                 break;
 
                             case Action::GetDirectoryListRequest:
                                 detail_get_directory_list::response_get_directory_list_request(
-                                    origin, message_size);
+                                    origin, msg_buffer.data(), message_size);
                                 break;
 
                             case Action::GetDirectoryListAnswer:
                                 detail_get_directory_list::response_get_directory_list_answer(
-                                    origin, message_size);
+                                    origin, msg_buffer.data(), message_size);
                                 break;
 
                             case Action::ReadRequest:
-                                detail_read::response_read_request(origin, message_size);
+                                detail_read::response_read_request(origin, msg_buffer.data(),
+                                                                   message_size);
                                 break;
 
                             case Action::CloseRequest:
-                                detail_close::response_close_request(origin, message_size);
+                                detail_close::response_close_request(origin, msg_buffer.data(),
+                                                                     message_size);
                                 break;
 
                             default: throw std::runtime_error("unexpected action code"); break;
@@ -1715,6 +1701,7 @@ namespace anarchofs {
 
             inline bool read_from_socket(int socket, void *v, std::size_t size) {
 #ifdef BUILD_AFS_DAEMON
+                /// Incorrect, tracker cannot be used outside the MPI thread
                 anarchofs::detail::tracker t_("read_from_socket");
 #endif
                 std::size_t total_read = 0;
@@ -1729,6 +1716,7 @@ namespace anarchofs {
 
             inline bool write_into_socket(int socket, const void *v, std::size_t size) {
 #ifdef BUILD_AFS_DAEMON
+                /// Incorrect, tracker cannot be used outside the MPI thread
                 anarchofs::detail::tracker t_("write_into_socket");
 #endif
                 std::size_t total_written = 0;
