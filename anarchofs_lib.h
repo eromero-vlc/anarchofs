@@ -46,10 +46,6 @@
 ///   if there is a path that is a file in one filesystem and a directory in other filesystem,
 ///   represented path as a file
 
-#ifdef BUILD_AFS_DAEMON
-#    include <mpi.h>
-#endif
-
 #ifdef AFS_DAEMON_USE_FUSE
 #    define FUSE_USE_VERSION 31
 #    include <fuse.h>
@@ -65,6 +61,7 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <mpi.h>
 #include <mutex>
 #include <set>
 #include <sstream>
@@ -148,6 +145,77 @@ namespace anarchofs {
             fflush(stdout);
 #endif
         }
+
+        inline void check_mpi(int error) {
+            if (error == MPI_SUCCESS) return;
+
+            char s[MPI_MAX_ERROR_STRING];
+            int len;
+            MPI_Error_string(error, s, &len);
+
+#    define CHECK_AND_THROW(ERR)                                                                   \
+        if (error == ERR) {                                                                        \
+            std::stringstream ss;                                                                  \
+            ss << "MPI error: " #ERR ": " << std::string(&s[0], &s[0] + len);                      \
+            throw std::runtime_error(ss.str());                                                    \
+        }
+
+            CHECK_AND_THROW(MPI_ERR_BUFFER);
+            CHECK_AND_THROW(MPI_ERR_COUNT);
+            CHECK_AND_THROW(MPI_ERR_TYPE);
+            CHECK_AND_THROW(MPI_ERR_TAG);
+            CHECK_AND_THROW(MPI_ERR_COMM);
+            CHECK_AND_THROW(MPI_ERR_RANK);
+            CHECK_AND_THROW(MPI_ERR_ROOT);
+            CHECK_AND_THROW(MPI_ERR_GROUP);
+            CHECK_AND_THROW(MPI_ERR_OP);
+            CHECK_AND_THROW(MPI_ERR_TOPOLOGY);
+            CHECK_AND_THROW(MPI_ERR_DIMS);
+            CHECK_AND_THROW(MPI_ERR_ARG);
+            CHECK_AND_THROW(MPI_ERR_UNKNOWN);
+            CHECK_AND_THROW(MPI_ERR_TRUNCATE);
+            CHECK_AND_THROW(MPI_ERR_OTHER);
+            CHECK_AND_THROW(MPI_ERR_INTERN);
+            CHECK_AND_THROW(MPI_ERR_IN_STATUS);
+            CHECK_AND_THROW(MPI_ERR_PENDING);
+            CHECK_AND_THROW(MPI_ERR_REQUEST);
+            CHECK_AND_THROW(MPI_ERR_LASTCODE);
+#    undef CHECK_AND_THROW
+        }
+
+        /// Client actions
+
+        enum class ClientAction : int {
+            GlobalOpenRequest,
+            /// Package description:
+            /// - request_action:int = GlobalOpenRequest (tag)
+            /// - path:char[*]
+            ///
+            /// Answer:
+            /// - file_id::size_t (> 0, or == 0 for error)
+
+            ReadRequest,
+            /// Package description:
+            /// - request_action:int = ReadRequest (tag)
+            /// - file_id:uint32
+            /// - offset:size_t
+            /// - size:size_t
+            ///
+            /// Answer if success:
+            /// - request_action:int = ReadRequest (tag)
+            /// - content:char[*]
+            /// Answer if error:
+            /// - request_action:int = -1 (tag)
+            /// - error_code:int64_t
+
+            CloseRequest,
+            /// Package description:
+            /// - request_action:int = CloseRequest (tag)
+            /// - file_id:uint32
+            ///
+            /// Answer:
+            /// - status:uint32 (== 0 for ok, otherwise for error)
+        };
     }
 
 #ifdef BUILD_AFS_DAEMON
@@ -318,46 +386,10 @@ namespace anarchofs {
         };
 
         using Func = std::function<void()>;
+
         inline Buffer<Func> &get_func_buffer() {
             static Buffer<Func> buffer(1024 * 16);
             return buffer;
-        }
-
-        inline void check_mpi(int error) {
-            if (error == MPI_SUCCESS) return;
-
-            char s[MPI_MAX_ERROR_STRING];
-            int len;
-            MPI_Error_string(error, s, &len);
-
-#    define CHECK_AND_THROW(ERR)                                                                   \
-        if (error == ERR) {                                                                        \
-            std::stringstream ss;                                                                  \
-            ss << "MPI error: " #ERR ": " << std::string(&s[0], &s[0] + len);                      \
-            throw std::runtime_error(ss.str());                                                    \
-        }
-
-            CHECK_AND_THROW(MPI_ERR_BUFFER);
-            CHECK_AND_THROW(MPI_ERR_COUNT);
-            CHECK_AND_THROW(MPI_ERR_TYPE);
-            CHECK_AND_THROW(MPI_ERR_TAG);
-            CHECK_AND_THROW(MPI_ERR_COMM);
-            CHECK_AND_THROW(MPI_ERR_RANK);
-            CHECK_AND_THROW(MPI_ERR_ROOT);
-            CHECK_AND_THROW(MPI_ERR_GROUP);
-            CHECK_AND_THROW(MPI_ERR_OP);
-            CHECK_AND_THROW(MPI_ERR_TOPOLOGY);
-            CHECK_AND_THROW(MPI_ERR_DIMS);
-            CHECK_AND_THROW(MPI_ERR_ARG);
-            CHECK_AND_THROW(MPI_ERR_UNKNOWN);
-            CHECK_AND_THROW(MPI_ERR_TRUNCATE);
-            CHECK_AND_THROW(MPI_ERR_OTHER);
-            CHECK_AND_THROW(MPI_ERR_INTERN);
-            CHECK_AND_THROW(MPI_ERR_IN_STATUS);
-            CHECK_AND_THROW(MPI_ERR_PENDING);
-            CHECK_AND_THROW(MPI_ERR_REQUEST);
-            CHECK_AND_THROW(MPI_ERR_LASTCODE);
-#    undef CHECK_AND_THROW
         }
 
         enum class Action : int {
@@ -1430,6 +1462,205 @@ namespace anarchofs {
     }
 
     ///
+    /// Internal messages process
+    ///
+
+    namespace detail {
+        inline bool process_internal_messages() {
+            tracker t_("processing internal MPI messages");
+            bool something_done = false;
+            while (true) {
+                MPI_Message msg;
+                MPI_Status status;
+                int flag;
+                {
+                    tracker t_("processing internal MPI messages (MPI_Iprobe)");
+                    check_mpi(MPI_Improbe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &flag, &msg,
+                                          &status));
+                }
+                if (flag == 0) break;
+
+                int origin = status.MPI_SOURCE;
+                Action action = (Action)(status.MPI_TAG % MaxAction);
+                int message_size;
+                check_mpi(MPI_Get_count(&status, MPI_CHAR, &message_size));
+                static std::vector<char> msg_buffer;
+                if (msg_buffer.size() < (std::size_t)message_size) msg_buffer.resize(message_size);
+                {
+                    tracker t_("processing MPI messages (MPI_Mrecv)");
+                    check_mpi(MPI_Mrecv(msg_buffer.data(), message_size, MPI_CHAR, &msg,
+                                        MPI_STATUS_IGNORE));
+                }
+                log("got a message from %d\n", origin);
+                switch (action) {
+                case Action::GetFileStatusRequest:
+                    detail_get_file_status::response_file_status_request(origin, msg_buffer.data(),
+                                                                         message_size);
+                    break;
+
+                case Action::GetFileStatusAnswer:
+                    detail_get_file_status::response_file_status_answer(origin, msg_buffer.data(),
+                                                                        message_size);
+                    break;
+
+                case Action::GlobalOpenRequest:
+                    detail_open_file::response_global_open_file_request(origin, msg_buffer.data(),
+                                                                        message_size);
+                    break;
+
+                case Action::GlobalOpenAnswer:
+                    detail_open_file::response_global_open_file_answer(origin, msg_buffer.data(),
+                                                                       message_size);
+                    break;
+
+                case Action::GetDirectoryListRequest:
+                    detail_get_directory_list::response_get_directory_list_request(
+                        origin, msg_buffer.data(), message_size);
+                    break;
+
+                case Action::GetDirectoryListAnswer:
+                    detail_get_directory_list::response_get_directory_list_answer(
+                        origin, msg_buffer.data(), message_size);
+                    break;
+
+                case Action::ReadRequest:
+                    detail_read::response_read_request(origin, msg_buffer.data(), message_size);
+                    break;
+
+                case Action::CloseRequest:
+                    detail_close::response_close_request(origin, msg_buffer.data(), message_size);
+                    break;
+
+                default: throw std::runtime_error("unexpected action code"); break;
+                }
+                something_done = true;
+            }
+
+            return something_done;
+        }
+    }
+
+    ///
+    /// Client process
+    ///
+
+    namespace detail {
+        /// Return the list of pending requests
+        /// NOTE: not thread-safe, accessed only by the MPI loop thread
+
+        inline std::vector<MPI_Comm> &get_clients() {
+            static std::vector<MPI_Comm> clients;
+            return clients;
+        }
+
+        inline void process_client_action(ClientAction action, const MPI_Comm &comm, int rank,
+                                          const char *buffer, int message_size) {
+            // Process action
+            switch (action) {
+            case ClientAction::GlobalOpenRequest: {
+                // Get path
+                std::string path(buffer, buffer + message_size);
+
+                // Open file
+                get_open_file(path.c_str(), [=](FileId file_id) {
+                    // Return back the file id
+                    auto response_buffer_size = sizeof(FileId);
+                    auto response_buffer = std::shared_ptr<char>(new char[response_buffer_size],
+                                                                 std::default_delete<char[]>());
+                    write_as_chars(file_id, response_buffer.get());
+                    MPI_Request req;
+                    check_mpi(MPI_Isend(response_buffer.get(), response_buffer_size, MPI_CHAR, rank,
+                                        (int)ClientAction::GlobalOpenRequest, comm, &req));
+                    get_pending_mpi_requests().push_back(MPI_RequestBuffer{req, response_buffer});
+                });
+                break;
+            }
+
+            case ClientAction::ReadRequest: {
+                // Read file id
+                FileId file_id = read_from_chars<FileId>(buffer);
+                // Read Offset
+                Offset offset = read_from_chars<Offset>(buffer + sizeof(FileId));
+                // Read size
+                Offset size = read_from_chars<Offset>(buffer + sizeof(FileId) + sizeof(Offset));
+                // Make the read
+                auto read_buffer =
+                    std::shared_ptr<char>(new char[size], std::default_delete<char[]>());
+                read(file_id, offset, size, read_buffer.get(), [=](std::int64_t size_or_error) {
+                    std::size_t response_buffer_size = size;
+                    auto response_buffer = read_buffer;
+                    int tag = (int)ClientAction::ReadRequest;
+                    if (size_or_error < 0) {
+                        // Return the error code only in case of error
+                        response_buffer_size = sizeof(std::int64_t);
+                        response_buffer = std::shared_ptr<char>(new char[response_buffer_size],
+                                                                std::default_delete<char[]>());
+                        write_as_chars(size_or_error, response_buffer.get());
+                        tag = -1;
+                    }
+                    MPI_Request req;
+                    check_mpi(MPI_Isend(response_buffer.get(), response_buffer_size, MPI_CHAR, rank,
+                                        tag, comm, &req));
+                    get_pending_mpi_requests().push_back(MPI_RequestBuffer{req, response_buffer});
+                });
+                break;
+            }
+
+            case ClientAction::CloseRequest: {
+                // Read file id
+                FileId file_id = read_from_chars<FileId>(buffer);
+
+                // Close the file
+                close(file_id, [=](bool success) {
+                    // Return back whether the action was successful
+                    auto response_buffer_size = sizeof(std::uint32_t);
+                    auto response_buffer = std::shared_ptr<char>(new char[response_buffer_size],
+                                                                 std::default_delete<char[]>());
+                    write_as_chars(std::uint32_t(success ? 0 : 1), response_buffer.get());
+                    MPI_Request req;
+                    check_mpi(MPI_Isend(response_buffer.get(), response_buffer_size, MPI_CHAR, rank,
+                                        (int)ClientAction::CloseRequest, comm, &req));
+                    get_pending_mpi_requests().push_back(MPI_RequestBuffer{req, response_buffer});
+                });
+                break;
+            }
+
+            default: throw std::runtime_error("process_client_action: invalid client action");
+            }
+        }
+
+        inline bool process_client_messages() {
+            tracker t_("processing client MPI messages");
+            bool something_done = false;
+            for (const auto comm : get_clients()) {
+                MPI_Message msg;
+                MPI_Status status;
+                int flag;
+                {
+                    tracker t_("processing internal MPI messages (MPI_Iprobe)");
+                    check_mpi(MPI_Improbe(MPI_ANY_SOURCE, MPI_ANY_TAG, comm, &flag, &msg, &status));
+                }
+                if (flag == 0) continue;
+
+                int origin = status.MPI_SOURCE;
+                int message_size;
+                ClientAction action = (ClientAction)status.MPI_TAG;
+                check_mpi(MPI_Get_count(&status, MPI_CHAR, &message_size));
+                static std::vector<char> msg_buffer;
+                if (msg_buffer.size() < (std::size_t)message_size) msg_buffer.resize(message_size);
+                {
+                    tracker t_("processing MPI messages (MPI_Mrecv)");
+                    check_mpi(MPI_Mrecv(msg_buffer.data(), message_size, MPI_CHAR, &msg,
+                                        MPI_STATUS_IGNORE));
+                }
+                process_client_action(action, comm, origin, msg_buffer.data(), message_size);
+                something_done = true;
+            }
+            return something_done;
+        }
+    }
+
+    ///
     /// Main MPI loop
     ///
 
@@ -1447,6 +1678,11 @@ namespace anarchofs {
         inline bool &is_mpi_initialized() {
             static bool b = false;
             return b;
+        }
+
+        inline std::string &get_port_name() {
+            static std::string port_name;
+            return port_name;
         }
 
         inline void mpi_loop(int *argc, char **argv[]) {
@@ -1469,13 +1705,17 @@ namespace anarchofs {
                 get_num_procs() = nprocs;
                 get_proc_id() = this_proc;
 
+                // Open a port
+                char port_name[MPI_MAX_PORT_NAME];
+                check_mpi(MPI_Open_port(MPI_INFO_NULL, port_name));
+                get_port_name() = std::string(port_name);
+
 #    ifdef AFS_DAEMON_TRACK_TIME
                 std::chrono::time_point<std::chrono::system_clock> last_report =
                     std::chrono::system_clock::now();
 #    endif
 
                 auto &buffer = get_func_buffer();
-                std::vector<char> msg_buffer;
                 while (!get_finalize_mpi_thread()) {
                     bool something_done = false;
 
@@ -1496,7 +1736,7 @@ namespace anarchofs {
                         something_done = true;
                     }
 
-                    // Check pending MPI requests
+                    // Check pending MPI requests with callback
                     auto &pending_mpi_request_callbacks = get_pending_mpi_request_callbacks();
                     if (pending_mpi_request_callbacks.size() > 0) {
                         log("checking pending MPI requests with callbacks\n");
@@ -1518,76 +1758,13 @@ namespace anarchofs {
                         something_done = true;
                     }
 
-                    {
-                        tracker t_("processing MPI messages");
-                        MPI_Message msg;
-                        MPI_Status status;
-                        int flag;
-                        {
-                            tracker t_("processing MPI messages (MPI_Iprobe)");
-                            check_mpi(MPI_Improbe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD,
-                                                  &flag, &msg, &status));
-                        }
-                        if (flag != 0) {
-                            int origin = status.MPI_SOURCE;
-                            int message_size;
-                            Action action = (Action)(status.MPI_TAG % MaxAction);
-                            check_mpi(MPI_Get_count(&status, MPI_CHAR, &message_size));
-                            if (msg_buffer.size() < (std::size_t)message_size)
-                                msg_buffer.resize(message_size);
-                            {
-                                tracker t_("processing MPI messages (MPI_Mrecv)");
-                                check_mpi(MPI_Mrecv(msg_buffer.data(), message_size, MPI_CHAR, &msg,
-                                                    MPI_STATUS_IGNORE));
-                            }
-                            log("got a message from %d\n", origin);
-                            switch (action) {
-                            case Action::GetFileStatusRequest:
-                                detail_get_file_status::response_file_status_request(
-                                    origin, msg_buffer.data(), message_size);
-                                break;
+                    // Process client messages
+                    if (process_client_messages()) something_done = true;
 
-                            case Action::GetFileStatusAnswer:
-                                detail_get_file_status::response_file_status_answer(
-                                    origin, msg_buffer.data(), message_size);
-                                break;
+                    // Process internal messages
+                    if (process_internal_messages()) something_done = true;
 
-                            case Action::GlobalOpenRequest:
-                                detail_open_file::response_global_open_file_request(
-                                    origin, msg_buffer.data(), message_size);
-                                break;
-
-                            case Action::GlobalOpenAnswer:
-                                detail_open_file::response_global_open_file_answer(
-                                    origin, msg_buffer.data(), message_size);
-                                break;
-
-                            case Action::GetDirectoryListRequest:
-                                detail_get_directory_list::response_get_directory_list_request(
-                                    origin, msg_buffer.data(), message_size);
-                                break;
-
-                            case Action::GetDirectoryListAnswer:
-                                detail_get_directory_list::response_get_directory_list_answer(
-                                    origin, msg_buffer.data(), message_size);
-                                break;
-
-                            case Action::ReadRequest:
-                                detail_read::response_read_request(origin, msg_buffer.data(),
-                                                                   message_size);
-                                break;
-
-                            case Action::CloseRequest:
-                                detail_close::response_close_request(origin, msg_buffer.data(),
-                                                                     message_size);
-                                break;
-
-                            default: throw std::runtime_error("unexpected action code"); break;
-                            }
-                            something_done = true;
-                        }
-                    }
-
+                    // Do pending tasks
                     {
                         tracker t_("do pending tasks");
                         while (buffer.size() > 0) {
@@ -1614,8 +1791,11 @@ namespace anarchofs {
 
             // Finalize MPI
             log("Finalizing MPI\n");
-            if (mpi_is_active) MPI_Finalize();
-            is_mpi_initialized() = false;
+            if (mpi_is_active) {
+                check_mpi(MPI_Close_port(get_port_name().c_str()));
+                MPI_Finalize();
+                is_mpi_initialized() = false;
+            }
         }
     }
 
@@ -1663,34 +1843,14 @@ namespace anarchofs {
 
     namespace server {
         namespace detail {
-            enum class Action : int {
-                GlobalOpenRequest,
+            enum class SocketAction : int {
+                Connect,
                 /// Package description:
-                /// - request_action:uint32 = GlobalOpenRequest
-                /// - path_length:uint32
-                /// - path:char[path_length]
+                /// - request_action:uint32 = Connect
                 ///
                 /// Answer:
-                /// - file_id::size_t (> 0, or == 0 for error)
-
-                ReadRequest,
-                /// Package description:
-                /// - request_action:uint32 = ReadRequest
-                /// - file_id:uint32
-                /// - offset:size_t
-                /// - size:size_t
-                ///
-                /// Answer:
-                /// - size_or_error:int64_t
-                /// - content:char[max(0,size_or_error)]
-
-                CloseRequest,
-                /// Package description:
-                /// - request_action:uint32 = CloseRequest
-                /// - file_id:uint32
-                ///
-                /// Answer:
-                /// - status:uint32 (== 0 for ok, otherwise for error)
+                /// - port_length:uint32
+                /// - port:char[port_length]
             };
 
             inline const char *get_socket_path() {
@@ -1764,92 +1924,25 @@ namespace anarchofs {
                     warning("process_socket_action: error reading action");
                     return false;
                 }
-                Action action = (Action)action_buffer;
+                SocketAction action = (SocketAction)action_buffer;
 
                 // Process action
                 switch (action) {
-                case Action::GlobalOpenRequest: {
-                    // Get path
-                    std::uint32_t path_length;
-                    if (!read_from_socket(socket, &path_length, sizeof(path_length))) {
-                        warning("process_socket_action: error reading path_length");
+                case SocketAction::Connect: {
+                    // Write port
+                    std::vector<char> answer(sizeof(std::uint32_t) + get_port_name().size());
+                    write_as_chars(std::uint32_t(get_port_name().size()), answer.data());
+                    std::copy(get_port_name().begin(), get_port_name().end(),
+                              answer.data() + sizeof(std::uint32_t));
+                    if (!write_into_socket(socket, (const void *)answer.data(), answer.size())) {
+                        warning("process_socket_action: error writing on socket\n");
                         return false;
                     }
-                    std::vector<char> path(path_length + 1);
-                    if (!read_from_socket(socket, path.data(), path_length)) {
-                        warning("process_socket_action: error reading path");
-                        return false;
-                    }
-
-                    log("socket open socket: %d path: %s\n", socket, path.data());
-
-                    // Open file
-                    get_open_file(path.data(), [=](FileId file_id) {
-                        log("socket open socket: %d returning: %d\n", socket, (int)file_id);
-
-                        // Track opened files by the socket
-                        get_opened_files_by_sockets().at(socket).insert(file_id);
-
-                        // Return back the file id
-                        if (!write_into_socket(socket, (const void *)&file_id, sizeof(FileId)))
-                            warning("process_socket_action: error writing on socket\n");
-                    });
-                    break;
-                }
-
-                case Action::ReadRequest: {
-                    std::vector<char> msg(sizeof(FileId) + sizeof(Offset) * 2);
-                    if (!read_from_socket(socket, msg.data(), msg.size())) {
-                        warning("process_socket_action: error reading read request");
-                        return false;
-                    }
-                    // Read file id
-                    FileId file_id = read_from_chars<FileId>(msg.data());
-                    // Read Offset
-                    Offset offset = read_from_chars<Offset>(msg.data() + sizeof(FileId));
-                    // Read size
-                    Offset size =
-                        read_from_chars<Offset>(msg.data() + sizeof(FileId) + sizeof(Offset));
-                    // Make the read
-                    auto read_buffer =
-                        std::make_shared<std::vector<char>>(sizeof(std::int64_t) + size);
-                    read(file_id, offset, size, read_buffer->data() + sizeof(std::int64_t),
-                         [=](std::int64_t size_or_error) {
-                             // Return the read size or an error code together with read content
-                             write_as_chars(size_or_error, read_buffer->data());
-                             ssize_t chars_to_write =
-                                 sizeof(std::int64_t) + (size_or_error < 0 ? 0 : size_or_error);
-                             if (size_or_error > (std::int64_t)size)
-                                 throw std::runtime_error(
-                                     "process_socket_action: got invalid `size_or_error`");
-                             if (!write_into_socket(socket, read_buffer->data(), chars_to_write))
-                                 warning("process_socket_action: error writing on socket\n");
-                         });
-                    break;
-                }
-
-                case Action::CloseRequest: {
-                    // Read file id
-                    FileId file_id;
-                    if (!read_from_socket(socket, &file_id, sizeof(file_id))) {
-                        warning("process_socket_action: error reading file_id");
-                        return false;
-                    }
-
-                    // Track opened files by the socket
-                    if (get_opened_files_by_sockets().at(socket).count(file_id) == 1)
-                        get_opened_files_by_sockets().at(socket).erase(file_id);
-
-                    log("socket close socket: %d id: %d\n", socket, (int)file_id);
-
-                    // Close the file
-                    close(file_id, [=](bool success) {
-                        log("socket close socket: %d id: %d returning: %d\n", socket, (int)file_id,
-                            success ? 0 : 1);
-                        // Return back whether the action was successful
-                        std::uint32_t r = (success ? 0 : 1);
-                        if (!write_into_socket(socket, (const void *)&r, sizeof(r)))
-                            warning("process_socket_action: error writing on socket\n");
+                    get_func_buffer().push_back([=]() {
+                        MPI_Comm new_comm;
+                        check_mpi(MPI_Comm_accept(get_port_name().c_str(), MPI_INFO_NULL, 0,
+                                                  MPI_COMM_SELF, &new_comm));
+                        get_clients().push_back(new_comm);
                     });
                     break;
                 }
@@ -2040,6 +2133,44 @@ namespace anarchofs {
                 }();
                 return socket;
             }
+
+            inline const MPI_Comm &get_comm() {
+                static MPI_Comm comm = [=]() {
+                    std::uint32_t action = (std::uint32_t)server::detail::SocketAction::Connect;
+                    if (!server::detail::write_into_socket(detail::get_socket(), &action,
+                                                           sizeof(action)))
+                        throw std::runtime_error("error writing in socket");
+                    std::uint32_t port_size = 0;
+                    if (!server::detail::read_from_socket(detail::get_socket(), &port_size,
+                                                          sizeof(port_size)))
+                        throw std::runtime_error("error reading from socket");
+                    std::string port(port_size, (char)0);
+                    if (!server::detail::read_from_socket(detail::get_socket(), &port[0],
+                                                          port_size))
+                        throw std::runtime_error("error reading from socket");
+                    // Make sure that MPI is initialized
+                    int flag;
+                    anarchofs::detail::check_mpi(MPI_Initialized(&flag));
+                    if (flag == 0)
+                        throw std::runtime_error("anarchofs::client::get_comm(): please initialize "
+                                                 "MPI before doing any operation");
+                    MPI_Comm comm;
+                    anarchofs::detail::check_mpi(
+                        MPI_Comm_connect(port.c_str(), MPI_INFO_NULL, 0, MPI_COMM_SELF, &comm));
+                    return comm;
+                }();
+                return comm;
+            }
+
+            inline int get_dest_rank() {
+                int nprocs, this_proc;
+                anarchofs::detail::check_mpi(MPI_Comm_rank(get_comm(), &this_proc));
+                anarchofs::detail::check_mpi(MPI_Comm_size(get_comm(), &nprocs));
+                if (nprocs != 2)
+                    throw std::runtime_error(
+                        "anarchofs::client:get_dest_rank(): error, invalid communicator");
+                return 1 - this_proc;
+            }
         }
 
         /// File handler
@@ -2054,19 +2185,14 @@ namespace anarchofs {
 
         inline File *open(const char *filename) {
             int filename_size = strlen(filename);
-            std::vector<char> buffer(sizeof(std::uint32_t) * 2 + filename_size);
-            anarchofs::detail::write_as_chars(
-                (std::uint32_t)server::detail::Action::GlobalOpenRequest, buffer.data());
-            anarchofs::detail::write_as_chars((std::uint32_t)filename_size,
-                                              buffer.data() + sizeof(std::uint32_t));
-            std::copy_n(filename, filename_size, buffer.data() + sizeof(std::uint32_t) * 2);
-            if (!server::detail::write_into_socket(detail::get_socket(), buffer.data(),
-                                                   buffer.size()))
-                throw std::runtime_error("error writing to socket");
-
+            anarchofs::detail::check_mpi(MPI_Send(
+                filename, filename_size, MPI_CHAR, detail::get_dest_rank(),
+                (int)anarchofs::detail::ClientAction::GlobalOpenRequest, detail::get_comm()));
             FileId file_id;
-            if (!server::detail::read_from_socket(detail::get_socket(), &file_id, sizeof(file_id)))
-                throw std::runtime_error("error reading from socket");
+            anarchofs::detail::check_mpi(
+                MPI_Recv(&file_id, sizeof(file_id), MPI_CHAR, detail::get_dest_rank(),
+                         (int)anarchofs::detail::ClientAction::GlobalOpenRequest,
+                         detail::get_comm(), MPI_STATUS_IGNORE));
             if (file_id != no_file_id)
                 return new File{file_id, 0};
             else
@@ -2087,31 +2213,36 @@ namespace anarchofs {
 
         inline std::int64_t read(File *f, char *v, std::size_t n) {
             // Prepare the message
-            std::vector<char> buffer(sizeof(std::uint32_t) + sizeof(FileId) +
-                                     sizeof(std::size_t) * 2);
-            anarchofs::detail::write_as_chars((std::uint32_t)server::detail::Action::ReadRequest,
-                                              buffer.data());
-            anarchofs::detail::write_as_chars(f->file_id, buffer.data() + sizeof(std::uint32_t));
-            anarchofs::detail::write_as_chars(
-                (std::size_t)f->offset, buffer.data() + sizeof(std::uint32_t) + sizeof(FileId));
+            std::vector<char> buffer(sizeof(FileId) + sizeof(std::size_t) * 2);
+            anarchofs::detail::write_as_chars(f->file_id, buffer.data());
+            anarchofs::detail::write_as_chars((std::size_t)f->offset,
+                                              buffer.data() + sizeof(FileId));
             anarchofs::detail::write_as_chars((std::size_t)n,
-                                              buffer.data() + sizeof(std::uint32_t) +
-                                                  sizeof(FileId) + sizeof(std::size_t));
-            if (!server::detail::write_into_socket(detail::get_socket(), buffer.data(),
-                                                   buffer.size()))
-                throw std::runtime_error("error writing to socket");
+                                              buffer.data() + sizeof(FileId) + sizeof(std::size_t));
+            anarchofs::detail::check_mpi(
+                MPI_Send(buffer.data(), buffer.size(), MPI_CHAR, detail::get_dest_rank(),
+                         (int)anarchofs::detail::ClientAction::ReadRequest, detail::get_comm()));
 
             // Process answer
-            std::int64_t error_or_size;
-            if (!server::detail::read_from_socket(detail::get_socket(), &error_or_size,
-                                                  sizeof(error_or_size)))
-                throw std::runtime_error("error reading from socket");
-            if (error_or_size <= 0) return error_or_size;
-            if (!server::detail::read_from_socket(detail::get_socket(), v, error_or_size))
-                throw std::runtime_error("error reading from socket");
+            MPI_Message msg;
+            MPI_Status status;
+            anarchofs::detail::check_mpi(MPI_Mprobe(detail::get_dest_rank(), MPI_ANY_TAG,
+                                                    detail::get_comm(), &msg, &status));
+            int message_size;
+            anarchofs::detail::check_mpi(MPI_Get_count(&status, MPI_CHAR, &message_size));
+            if (status.MPI_TAG != (int)anarchofs::detail::ClientAction::ReadRequest &&
+                message_size != sizeof(std::int64_t))
+                throw std::runtime_error("anarchofs::client::read(): error in protocol");
+            std::int64_t error_or_size = message_size;
+            auto buffer_response =
+                status.MPI_TAG == (int)anarchofs::detail::ClientAction::ReadRequest
+                    ? v
+                    : (char *)&error_or_size;
+            anarchofs::detail::check_mpi(
+                MPI_Mrecv(buffer_response, message_size, MPI_CHAR, &msg, MPI_STATUS_IGNORE));
 
             // Advanced the cursor
-            f->offset += error_or_size;
+            if (error_or_size > 0) f->offset += error_or_size;
 
             return error_or_size;
         }
@@ -2121,20 +2252,18 @@ namespace anarchofs {
         /// \return: whether the operation was successful
 
         inline bool close(File *f) {
-            // Prepare the message
-            std::vector<char> buffer(sizeof(std::uint32_t) + sizeof(FileId));
-            anarchofs::detail::write_as_chars((std::uint32_t)server::detail::Action::CloseRequest,
-                                              buffer.data());
-            anarchofs::detail::write_as_chars(f->file_id, buffer.data() + sizeof(std::uint32_t));
-            if (!server::detail::write_into_socket(detail::get_socket(), buffer.data(),
-                                                   buffer.size()))
-                throw std::runtime_error("error writing to socket");
+            anarchofs::detail::check_mpi(
+                MPI_Send(&f->file_id, sizeof(f->file_id), MPI_CHAR, detail::get_dest_rank(),
+                         (int)anarchofs::detail::ClientAction::CloseRequest, detail::get_comm()));
 
             std::uint32_t response = 0;
-            if (!server::detail::read_from_socket(detail::get_socket(), &response,
-                                                  sizeof(response)))
-                throw std::runtime_error("error reading from socket");
+            anarchofs::detail::check_mpi(
+                MPI_Recv(&response, sizeof(response), MPI_CHAR, detail::get_dest_rank(),
+                         (int)anarchofs::detail::ClientAction::CloseRequest, detail::get_comm(),
+                         MPI_STATUS_IGNORE));
+
             delete f;
+
             return response == 0;
         }
     }
