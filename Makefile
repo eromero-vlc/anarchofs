@@ -22,8 +22,11 @@ test_socket: test_socket.cc anarchofs_lib.h Makefile
 test_socket_mpi: test_socket.cc anarchofs_lib.h Makefile
 	${CXX} ${CXXFLAGS} -DUSE_MPI test_socket.cc -o test_socket_mpi
 
+test_daemonless: test_daemonless.cc anarchofs_lib.h Makefile
+	${CXX} ${CXXFLAGS} test_daemonless.cc -o test_daemonless
+
 clean:
-	rm -f anarchofs test_socket test_socket_mpi
+	rm -f anarchofs test_socket test_socket_mpi test_daemonless
 
 format:
 	clang-format -i anarchofs.cc anarchofs_lib.h test_socket.cc

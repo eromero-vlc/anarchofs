@@ -46,11 +46,6 @@
 ///   if there is a path that is a file in one filesystem and a directory in other filesystem,
 ///   represented path as a file
 
-#ifdef AFS_DAEMON_USE_FUSE
-#    define FUSE_USE_VERSION 31
-#    include <fuse.h>
-#endif
-
 #include <algorithm>
 #include <cassert>
 #include <condition_variable>
@@ -113,23 +108,15 @@ namespace anarchofs {
 
 #ifdef ANARCOFS_LOG
         template <typename... Args> void log(const char *s, Args... args) {
-#    ifdef AFS_DAEMON_USE_FUSE
-            fuse_log(FUSE_LOG_DEBUG, s, args...);
-#    else
             printf("[%d] ", get_proc_id());
             printf(s, args...);
             fflush(stdout);
-#    endif
         }
 
         template <typename... Args> void warning(const char *s, Args... args) {
-#    ifdef AFS_DAEMON_USE_FUSE
-            fuse_log(FUSE_LOG_DEBUG, s, args...);
-#    else
             printf("[%d] warning: ", get_proc_id());
             printf(s, args...);
             fflush(stdout);
-#    endif
         }
 #else
         template <typename... Args> void log(const char *, Args...) {}
@@ -137,13 +124,9 @@ namespace anarchofs {
 #endif
 
         template <typename... Args> void show_error(const char *s, Args... args) {
-#ifdef AFS_DAEMON_USE_FUSE
-            fuse_log(FUSE_LOG_DEBUG, s, args...);
-#else
             printf("[%d] error: ", get_proc_id());
             printf(s, args...);
             fflush(stdout);
-#endif
         }
 
         inline void check_mpi(int error) {
@@ -153,12 +136,12 @@ namespace anarchofs {
             int len;
             MPI_Error_string(error, s, &len);
 
-#    define CHECK_AND_THROW(ERR)                                                                   \
-        if (error == ERR) {                                                                        \
-            std::stringstream ss;                                                                  \
-            ss << "MPI error: " #ERR ": " << std::string(&s[0], &s[0] + len);                      \
-            throw std::runtime_error(ss.str());                                                    \
-        }
+#define CHECK_AND_THROW(ERR)                                                                       \
+    if (error == ERR) {                                                                            \
+        std::stringstream ss;                                                                      \
+        ss << "MPI error: " #ERR ": " << std::string(&s[0], &s[0] + len);                          \
+        throw std::runtime_error(ss.str());                                                        \
+    }
 
             CHECK_AND_THROW(MPI_ERR_BUFFER);
             CHECK_AND_THROW(MPI_ERR_COUNT);
@@ -180,7 +163,7 @@ namespace anarchofs {
             CHECK_AND_THROW(MPI_ERR_PENDING);
             CHECK_AND_THROW(MPI_ERR_REQUEST);
             CHECK_AND_THROW(MPI_ERR_LASTCODE);
-#    undef CHECK_AND_THROW
+#undef CHECK_AND_THROW
         }
 
         /// Client actions
@@ -197,6 +180,7 @@ namespace anarchofs {
             ReadRequest,
             /// Package description:
             /// - request_action:int = ReadRequest (tag)
+            /// - request_num:int
             /// - file_id:uint32
             /// - offset:size_t
             /// - size:size_t
@@ -218,7 +202,6 @@ namespace anarchofs {
         };
     }
 
-#ifdef BUILD_AFS_DAEMON
     namespace detail {
 
         /// Performance metrics, time, memory usage, etc
@@ -247,7 +230,7 @@ namespace anarchofs {
             /// Bytes read and write from memory
             double memops;
 
-#    ifdef AFS_DAEMON_TRACK_TIME
+#ifdef AFS_DAEMON_TRACK_TIME
             /// Whether the tacker has been stopped
             bool stopped;
             /// Name of the function being tracked
@@ -279,10 +262,10 @@ namespace anarchofs {
                 timing.memops += memops;
                 timing.calls++;
             }
-#    else
+#else
             tracker(const std::string &) {}
             void stop() {}
-#    endif
+#endif
 
             // Forbid copy constructor and assignment operator
             tracker(const tracker &) = delete;
@@ -294,7 +277,7 @@ namespace anarchofs {
 
         template <typename OStream> void reportTimings(OStream &s) {
             // Print the timings alphabetically
-            s << "Timing of kernels:" << std::endl;
+            s << "Timing from rank " << get_proc_id() << " :" << std::endl;
             s << "------------------" << std::endl;
             const auto &timings = getTimings();
             std::vector<std::string> names;
@@ -437,13 +420,18 @@ namespace anarchofs {
             /// - request_num:uint32
             /// - path:null-ending string
 
-            GetDirectoryListAnswer = 8
+            GetDirectoryListAnswer = 8,
             /// Package description:
             /// request_num:uint32
             /// [
             ///  - type:FileType
             ///  - path:null-ending string
             /// ]*
+
+            FinalizeRequest = 9
+            /// Package description:
+            /// - constant:char = 0
+
         };
 
         const int MaxAction = 16;
@@ -469,11 +457,19 @@ namespace anarchofs {
             return num_procs;
         }
 
+        /// Return the list of node leaders ranks
+        /// NOTE: not thread-safe, accessed only by the MPI loop thread
+
+        inline std::vector<int> &get_node_leaders() {
+            static std::vector<int> node_leaders;
+            return node_leaders;
+        }
+
         /// Return this process id (use as id for this filesystem)
         /// Read access by everyone and write access by MPI loop thread
 
         inline unsigned int &get_proc_id() {
-            static unsigned int proc_id;
+            static unsigned int proc_id = -1;
             return proc_id;
         }
 
@@ -626,7 +622,7 @@ namespace anarchofs {
                 get_pending_mpi_requests().push_back(MPI_RequestBuffer{req, response_buffer});
             }
 
-            inline void response_file_status_answer(int rank, const char *buffer,
+            inline void response_file_status_answer(int /*rank*/, const char *buffer,
                                                     int message_size) {
                 assert(message_size == sizeof(RequestNum) + sizeof(FileType) + sizeof(Offset));
                 RequestNum request_num = get_request_num(buffer);
@@ -664,27 +660,30 @@ namespace anarchofs {
         // Mark the requests from this node
         static RequestNum next_req = 0;
         RequestNum first_req = next_req;
-        next_req += get_num_procs();
+        next_req += get_node_leaders().size();
 
         // Prepare the responses
         {
             std::unique_lock<std::mutex> unique_lock(get_file_status_pending_transactions_mutex());
-            for (unsigned int rank = 0; rank < get_num_procs(); ++rank)
-                get_file_status_pending_transactions()[first_req + rank] = {};
+            for (unsigned int leader_rank = 0; leader_rank < get_node_leaders().size();
+                 ++leader_rank)
+                get_file_status_pending_transactions()[first_req + leader_rank] = {};
         }
 
         // Queue the requests
         std::string msg_pattern = std::string(sizeof(RequestNum), 0) + std::string(path);
         get_func_buffer().push_back([=]() {
             log("send file_status requests %s\n", msg_pattern.c_str() + sizeof(RequestNum));
-            for (unsigned int rank = 0; rank < get_num_procs(); ++rank) {
+            for (unsigned int leader_rank = 0; leader_rank < get_node_leaders().size();
+                 ++leader_rank) {
                 auto this_msg_pattern_buffer = std::shared_ptr<char>(new char[msg_pattern.size()],
                                                                      std::default_delete<char[]>());
                 std::copy_n(msg_pattern.begin(), msg_pattern.size(), this_msg_pattern_buffer.get());
-                set_request_num(first_req + rank, this_msg_pattern_buffer.get());
+                set_request_num(first_req + leader_rank, this_msg_pattern_buffer.get());
                 MPI_Request req;
                 check_mpi(MPI_Isend(this_msg_pattern_buffer.get(), msg_pattern.size(), MPI_CHAR,
-                                    rank, (int)Action::GetFileStatusRequest, MPI_COMM_WORLD, &req));
+                                    get_node_leaders().at(leader_rank),
+                                    (int)Action::GetFileStatusRequest, MPI_COMM_WORLD, &req));
                 get_pending_mpi_requests().push_back(
                     MPI_RequestBuffer{req, this_msg_pattern_buffer});
             }
@@ -694,13 +693,13 @@ namespace anarchofs {
         *file_size = 0;
         *file_type = FileType::NotExists;
         auto &pending_transactions = get_file_status_pending_transactions();
-        for (unsigned int rank = 0; rank < get_num_procs(); ++rank) {
-            auto file_type_and_size = pending_transactions.at(first_req + rank).get();
+        for (unsigned int leader_rank = 0; leader_rank < get_node_leaders().size(); ++leader_rank) {
+            auto file_type_and_size = pending_transactions.at(first_req + leader_rank).get();
             if (file_type_and_size.file_type == FileType::NotExists) continue;
             *file_type = merge_file_types(*file_type, file_type_and_size.file_type);
             *file_size += file_type_and_size.file_size;
             std::unique_lock<std::mutex> unique_lock(get_file_status_pending_transactions_mutex());
-            pending_transactions.erase(first_req + rank);
+            pending_transactions.erase(first_req + leader_rank);
         }
 
         // Return whether the file exists
@@ -803,29 +802,31 @@ namespace anarchofs {
         // Mark the requests from this node
         static RequestNum next_req = 0;
         RequestNum first_req = next_req;
-        next_req += get_num_procs();
+        next_req += get_node_leaders().size();
 
         // Prepare the responses
         {
             std::unique_lock<std::mutex> unique_lock(
                 get_directory_list_pending_transactions_mutex());
-            for (unsigned int rank = 0; rank < get_num_procs(); ++rank)
-                get_directory_list_pending_transactions()[first_req + rank] = {};
+            for (unsigned int leader_rank = 0; leader_rank < get_node_leaders().size();
+                 ++leader_rank)
+                get_directory_list_pending_transactions()[first_req + leader_rank] = {};
         }
 
         // Queue the requests
         std::string msg_pattern = std::string(sizeof(RequestNum), 0) + std::string(path);
         get_func_buffer().push_back([=]() {
             log("send get_directory_list requests %s\n", msg_pattern.c_str() + sizeof(RequestNum));
-            for (unsigned int rank = 0; rank < get_num_procs(); ++rank) {
+            for (unsigned int leader_rank = 0; leader_rank < get_node_leaders().size();
+                 ++leader_rank) {
                 auto this_msg_pattern_buffer = std::shared_ptr<char>(new char[msg_pattern.size()],
                                                                      std::default_delete<char[]>());
                 std::copy_n(msg_pattern.begin(), msg_pattern.size(), this_msg_pattern_buffer.get());
-                set_request_num(first_req + rank, this_msg_pattern_buffer.get());
+                set_request_num(first_req + leader_rank, this_msg_pattern_buffer.get());
                 MPI_Request req;
                 check_mpi(MPI_Isend(this_msg_pattern_buffer.get(), msg_pattern.size(), MPI_CHAR,
-                                    rank, (int)Action::GetDirectoryListRequest, MPI_COMM_WORLD,
-                                    &req));
+                                    get_node_leaders().at(leader_rank),
+                                    (int)Action::GetDirectoryListRequest, MPI_COMM_WORLD, &req));
                 get_pending_mpi_requests().push_back(
                     MPI_RequestBuffer{req, this_msg_pattern_buffer});
             }
@@ -834,8 +835,8 @@ namespace anarchofs {
         // Wait for the responses
         std::unordered_map<std::string, FileType> response(16);
         auto &pending_transactions = get_directory_list_pending_transactions();
-        for (unsigned int rank = 0; rank < get_num_procs(); ++rank) {
-            auto response_rank = pending_transactions.at(first_req + rank).get();
+        for (unsigned int leader_rank = 0; leader_rank < get_node_leaders().size(); ++leader_rank) {
+            auto response_rank = pending_transactions.at(first_req + leader_rank).get();
             for (const auto &it : response_rank) {
                 if (response.count(it.filename) == 0)
                     response[it.filename] = it.type;
@@ -844,7 +845,7 @@ namespace anarchofs {
             }
             std::unique_lock<std::mutex> unique_lock(
                 get_directory_list_pending_transactions_mutex());
-            pending_transactions.erase(first_req + rank);
+            pending_transactions.erase(first_req + leader_rank);
         }
 
         std::vector<FilenameType> r;
@@ -859,7 +860,7 @@ namespace anarchofs {
 
     namespace detail {
 
-#    ifdef AFS_DAEMON_USE_MPIIO
+#ifdef AFS_DAEMON_USE_MPIIO
         using FileHandle = MPI_File;
 
         inline bool file_open(const char *filename, MPI_File &f) {
@@ -882,7 +883,7 @@ namespace anarchofs {
         }
 
         inline void file_close(MPI_File &f) { check_mpi(MPI_File_close(&f)); }
-#    else
+#else
         using FileHandle = std::FILE *;
 
         inline bool file_open(const char *filename, std::FILE *&f) {
@@ -912,7 +913,7 @@ namespace anarchofs {
         }
 
         inline void file_close(std::FILE *f) { std::fclose(f); }
-#    endif
+#endif
 
         using FileInfo = std::vector<Offset>; ///< First offset on each node
 
@@ -1077,10 +1078,12 @@ namespace anarchofs {
                 get_pending_mpi_requests().push_back(MPI_RequestBuffer{req, response_buffer});
             }
 
-            inline void response_global_open_file_answer(int rank, const char *buffer,
+            inline void response_global_open_file_answer(int /*rank*/, const char *buffer,
                                                          int message_size) {
                 tracker t_("open file processing answers");
 
+                if (message_size != sizeof(RequestNum) + sizeof(Offset))
+                    throw std::runtime_error("error in global open file protocol");
                 RequestNum request_num = get_request_num(buffer);
                 const char *msg_it = buffer + sizeof(RequestNum);
                 Offset file_size_plus_one = read_from_chars<Offset>(msg_it);
@@ -1103,7 +1106,7 @@ namespace anarchofs {
 
         static RequestNum next_req = 0;
         RequestNum first_req = next_req;
-        next_req += get_num_procs();
+        next_req += get_node_leaders().size();
 
         // Create an entry
         static FileId next_file_id = 1;
@@ -1122,20 +1125,23 @@ namespace anarchofs {
 
             // Prepare the responses
             TickingCallback<QueueCallback::DoQueueCallback> callback(process);
-            for (unsigned int rank = 0; rank < get_num_procs(); ++rank)
+            for (unsigned int leader_rank = 0; leader_rank < get_node_leaders().size();
+                 ++leader_rank)
                 get_open_file_pending_transactions().emplace(
-                    std::make_pair(first_req + rank, SizeAndCallback{0, callback}));
+                    std::make_pair(first_req + leader_rank, SizeAndCallback{0, callback}));
 
             // Send the requests
             //log("send get_open_file requests %d\n", file_id);
-            for (unsigned int rank = 0; rank < get_num_procs(); ++rank) {
+            for (unsigned int leader_rank = 0; leader_rank < get_node_leaders().size();
+                 ++leader_rank) {
                 auto this_msg_pattern_buffer = std::shared_ptr<char>(new char[msg_pattern.size()],
                                                                      std::default_delete<char[]>());
                 std::copy_n(msg_pattern.begin(), msg_pattern.size(), this_msg_pattern_buffer.get());
-                set_request_num(first_req + rank, this_msg_pattern_buffer.get());
+                set_request_num(first_req + leader_rank, this_msg_pattern_buffer.get());
                 MPI_Request req;
                 check_mpi(MPI_Isend(this_msg_pattern_buffer.get(), msg_pattern.size(), MPI_CHAR,
-                                    rank, (int)Action::GlobalOpenRequest, MPI_COMM_WORLD, &req));
+                                    get_node_leaders().at(leader_rank),
+                                    (int)Action::GlobalOpenRequest, MPI_COMM_WORLD, &req));
                 get_pending_mpi_requests().push_back(
                     MPI_RequestBuffer{req, this_msg_pattern_buffer});
             }
@@ -1145,18 +1151,20 @@ namespace anarchofs {
         const auto process = [=]() {
             log("mpi open id: %d (process)\n", (int)file_id);
 
-            std::vector<Offset> file_sizes(get_num_procs());
+            std::vector<Offset> file_sizes(get_node_leaders().size());
             bool file_exists = false;
             auto &pending_transactions = get_open_file_pending_transactions();
-            for (unsigned int rank = 0; rank < get_num_procs(); ++rank) {
-                Offset file_size_plus_one = pending_transactions.at(first_req + rank).size;
+            for (unsigned int leader_rank = 0; leader_rank < get_node_leaders().size();
+                 ++leader_rank) {
+                Offset file_size_plus_one = pending_transactions.at(first_req + leader_rank).size;
                 if (file_size_plus_one > 0) file_exists = true;
-                file_sizes[rank] = file_size_plus_one == 0 ? 0 : file_size_plus_one - 1;
+                file_sizes[leader_rank] = file_size_plus_one == 0 ? 0 : file_size_plus_one - 1;
             }
 
             // Erase transactions
-            for (unsigned int rank = 0; rank < get_num_procs(); ++rank)
-                pending_transactions.erase(first_req + rank);
+            for (unsigned int leader_rank = 0; leader_rank < get_node_leaders().size();
+                 ++leader_rank)
+                pending_transactions.erase(first_req + leader_rank);
 
             // Return special code if the file does not exists
             if (!file_exists) {
@@ -1166,9 +1174,10 @@ namespace anarchofs {
             }
 
             // Get the offsets
-            std::vector<Offset> offsets(get_num_procs() + 1);
-            for (unsigned int rank = 0; rank < get_num_procs(); ++rank)
-                offsets[rank + 1] = offsets[rank] + file_sizes[rank];
+            std::vector<Offset> offsets(get_node_leaders().size() + 1);
+            for (unsigned int leader_rank = 0; leader_rank < get_node_leaders().size();
+                 ++leader_rank)
+                offsets[leader_rank + 1] = offsets[leader_rank] + file_sizes[leader_rank];
             get_open_files_cache()[file_id] = offsets;
 
             response_callback(file_id);
@@ -1217,6 +1226,9 @@ namespace anarchofs {
             inline void response_read_request(int rank, const char *buffer, int message_size) {
                 tracker t_("read file processing requests");
 
+                if (message_size != sizeof(RequestNum) + sizeof(FileId) + sizeof(Offset) * 2)
+                    throw std::runtime_error("error in protocol read");
+
                 RequestNum request_num = get_request_num(buffer);
                 FileId file_id = read_from_chars<FileId>(buffer + sizeof(RequestNum));
                 Offset local_offset =
@@ -1233,7 +1245,7 @@ namespace anarchofs {
                 FileHandle f;
                 if (!get_local_opened_files().get_file_handler(FromAndFileId{rank, file_id}, f))
                     throw std::runtime_error("response_read_request: file_id is not a valid");
-#    ifdef AFS_DAEMON_USE_MPIIO
+#ifdef AFS_DAEMON_USE_MPIIO
                 MPI_Request req = file_read(f, local_offset, response_buffer.get(), local_size);
                 get_pending_mpi_request_callbacks().push_back(MPI_RequestCallback{
                     req, TickingCallback<QueueCallback::DontQueueCallback>([=]() {
@@ -1246,7 +1258,7 @@ namespace anarchofs {
                             MPI_RequestBuffer{req, response_buffer});
                     })});
 
-#    else
+#else
                 file_read(f, local_offset, response_buffer.get(), local_size);
                 t0_.stop();
 
@@ -1256,7 +1268,7 @@ namespace anarchofs {
                                     (int)Action::ReadAnswer + (int)request_num * MaxAction,
                                     MPI_COMM_WORLD, &req));
                 get_pending_mpi_requests().push_back(MPI_RequestBuffer{req, response_buffer});
-#    endif
+#endif
             }
         }
     }
@@ -1284,7 +1296,7 @@ namespace anarchofs {
         // Mark the requests from this node
         static RequestNum next_req = 0;
         RequestNum first_req = next_req;
-        next_req += get_num_procs();
+        next_req += get_node_leaders().size();
 
         log("mpi read (starting) request: %d id: %d from: %d size: %d\n", (int)first_req,
             (int)file_id, (int)offset, (int)count);
@@ -1300,24 +1312,27 @@ namespace anarchofs {
             }
 
             // Prepare the responses
-            static std::vector<int> next_tag_request_number(get_num_procs());
-            std::vector<Offset> local_offsets(get_num_procs());
-            std::vector<Offset> local_counts(get_num_procs());
-            std::vector<Offset> str_offsets(get_num_procs());
+            static std::vector<int> next_tag_request_number(get_node_leaders().size());
+            std::vector<Offset> local_offsets(get_node_leaders().size());
+            std::vector<Offset> local_counts(get_node_leaders().size());
+            std::vector<Offset> str_offsets(get_node_leaders().size());
             const auto &offsets = get_open_files_cache().at(file_id);
             TickingCallback<QueueCallback::DontQueueCallback> callback(process);
-            for (unsigned int rank = 0; rank < get_num_procs(); ++rank) {
-                Offset first_element = std::max(offsets[rank], std::min(offsets[rank + 1], offset));
-                Offset last_element =
-                    std::max(offsets[rank], std::min(offsets[rank + 1], offset + count));
+            for (unsigned int leader_rank = 0; leader_rank < get_node_leaders().size();
+                 ++leader_rank) {
+                Offset first_element =
+                    std::max(offsets[leader_rank], std::min(offsets[leader_rank + 1], offset));
+                Offset last_element = std::max(offsets[leader_rank],
+                                               std::min(offsets[leader_rank + 1], offset + count));
                 if (first_element < last_element) {
-                    str_offsets[rank] = first_element - offset;
-                    local_offsets[rank] = first_element - offsets[rank];
-                    local_counts[rank] = last_element - first_element;
+                    str_offsets[leader_rank] = first_element - offset;
+                    local_offsets[leader_rank] = first_element - offsets[leader_rank];
+                    local_counts[leader_rank] = last_element - first_element;
                     MPI_Request req;
                     check_mpi(MPI_Irecv(
-                        buffer + str_offsets[rank], local_counts[rank], MPI_CHAR, rank,
-                        (int)Action::ReadAnswer + MaxAction * next_tag_request_number[rank],
+                        buffer + str_offsets[leader_rank], local_counts[leader_rank], MPI_CHAR,
+                        get_node_leaders().at(leader_rank),
+                        (int)Action::ReadAnswer + MaxAction * next_tag_request_number[leader_rank],
                         MPI_COMM_WORLD, &req));
                     get_pending_mpi_request_callbacks().push_back(
                         MPI_RequestCallback{req, callback});
@@ -1325,27 +1340,31 @@ namespace anarchofs {
             }
 
             //log("mpi read (send) request: %d\n", (int)first_req);
-            for (unsigned int rank = 0; rank < get_num_procs(); ++rank) {
-                if (local_counts[rank] == 0) continue;
+            for (unsigned int leader_rank = 0; leader_rank < get_node_leaders().size();
+                 ++leader_rank) {
+                if (local_counts[leader_rank] == 0) continue;
                 std::size_t this_msg_pattern_size =
                     sizeof(RequestNum) + sizeof(FileId) + sizeof(Offset) * 2;
                 auto this_msg_pattern_buffer = std::shared_ptr<char>(
                     new char[this_msg_pattern_size], std::default_delete<char[]>());
                 auto this_msg_pattern = this_msg_pattern_buffer.get();
-                set_request_num(RequestNum(next_tag_request_number[rank]), &this_msg_pattern[0]);
+                set_request_num(RequestNum(next_tag_request_number[leader_rank]),
+                                &this_msg_pattern[0]);
                 write_as_chars(file_id, &this_msg_pattern[sizeof(RequestNum)]);
-                write_as_chars(local_offsets[rank],
+                write_as_chars(local_offsets[leader_rank],
                                &this_msg_pattern[sizeof(RequestNum) + sizeof(FileId)]);
                 write_as_chars(
-                    local_counts[rank],
+                    local_counts[leader_rank],
                     &this_msg_pattern[sizeof(RequestNum) + sizeof(FileId) + sizeof(Offset)]);
                 MPI_Request req;
-                check_mpi(MPI_Isend(this_msg_pattern, this_msg_pattern_size, MPI_CHAR, rank,
-                                    (int)Action::ReadRequest, MPI_COMM_WORLD, &req));
+                check_mpi(MPI_Isend(this_msg_pattern, this_msg_pattern_size, MPI_CHAR,
+                                    get_node_leaders().at(leader_rank), (int)Action::ReadRequest,
+                                    MPI_COMM_WORLD, &req));
                 get_pending_mpi_requests().push_back(
                     MPI_RequestBuffer{req, this_msg_pattern_buffer});
-                next_tag_request_number[rank] = (next_tag_request_number[rank] + 1) %
-                                                (std::numeric_limits<int>::max() / MaxAction);
+                next_tag_request_number[leader_rank] =
+                    (next_tag_request_number[leader_rank] + 1) %
+                    (std::numeric_limits<int>::max() / MaxAction);
             }
         };
 
@@ -1425,17 +1444,19 @@ namespace anarchofs {
             }
 
             const auto &offsets = get_open_files_cache().at(file_id);
-            for (unsigned int rank = 0; rank < get_num_procs(); ++rank) {
-                if (offsets[rank] == offsets[rank + 1]) continue;
+            for (unsigned int leader_rank = 0; leader_rank < get_node_leaders().size();
+                 ++leader_rank) {
+                if (offsets[leader_rank] == offsets[leader_rank + 1]) continue;
                 std::size_t this_msg_pattern_size = sizeof(RequestNum) + sizeof(FileId);
                 auto this_msg_pattern_buffer = std::shared_ptr<char>(
                     new char[this_msg_pattern_size], std::default_delete<char[]>());
                 auto this_msg_pattern = this_msg_pattern_buffer.get();
-                set_request_num(first_req + rank, &this_msg_pattern[0]);
+                set_request_num(first_req + leader_rank, &this_msg_pattern[0]);
                 write_as_chars(file_id, &this_msg_pattern[sizeof(RequestNum)]);
                 MPI_Request req;
-                check_mpi(MPI_Isend(this_msg_pattern, this_msg_pattern_size, MPI_CHAR, rank,
-                                    (int)Action::CloseRequest, MPI_COMM_WORLD, &req));
+                check_mpi(MPI_Isend(this_msg_pattern, this_msg_pattern_size, MPI_CHAR,
+                                    get_node_leaders().at(leader_rank), (int)Action::CloseRequest,
+                                    MPI_COMM_WORLD, &req));
                 get_pending_mpi_requests().push_back(
                     MPI_RequestBuffer{req, this_msg_pattern_buffer});
             }
@@ -1459,6 +1480,78 @@ namespace anarchofs {
         });
         promise.get();
         return success;
+    }
+
+    ///
+    /// Finalize the protocol
+    ///
+
+    namespace detail {
+        inline std::vector<char> &get_finishing_requests() {
+            static std::vector<char> finishing_requests(get_num_procs());
+            return finishing_requests;
+        }
+
+        inline std::function<void()> &get_finishing_callback() {
+            static std::function<void()> callback;
+            return callback;
+        }
+
+        namespace detail_finishing {
+            inline void response_finishing_request(int rank, const char *buffer, int message_size) {
+                if (message_size != 1 || buffer[0] != 0)
+                    throw std::runtime_error("error in finishing protocol");
+
+                log("mpi finalize request from %d\n", rank);
+
+                // Annotate that rank isn't sending more requests
+                get_finishing_requests().at(rank) = 1;
+
+                // Check if all ranks have made the request
+                bool all_finishing = true;
+                for (const auto &it : get_finishing_requests())
+                    if (it == 0) all_finishing = false;
+                if (!all_finishing) return;
+
+                // If so, make the callback
+                if (get_finishing_callback()) get_finishing_callback()();
+            }
+        }
+    }
+
+    /// Finalize the exchange of files
+    /// \param: callback when all processes have invoked this function
+
+    inline void finalize(std::function<void()> response_callback) {
+        using namespace detail;
+
+        log("mpi finalize\n");
+
+        // Set the callback
+        get_finishing_callback() = response_callback;
+
+        // Queue the requests
+        get_func_buffer().push_back([=]() {
+            auto this_msg_pattern_buffer =
+                std::shared_ptr<char>(new char[1], std::default_delete<char[]>());
+            this_msg_pattern_buffer.get()[0] = 0;
+            for (unsigned int rank = 0; rank < get_num_procs(); ++rank) {
+                MPI_Request req;
+                check_mpi(MPI_Isend(this_msg_pattern_buffer.get(), 1, MPI_CHAR, rank,
+                                    (int)Action::FinalizeRequest, MPI_COMM_WORLD, &req));
+                get_pending_mpi_requests().push_back(
+                    MPI_RequestBuffer{req, this_msg_pattern_buffer});
+            }
+        });
+    }
+
+    /// Finalize the exchange of files
+
+    inline void finalize() {
+        struct Void {};
+        detail::Promise<Void> promise{};
+        finalize([&]() { promise.set({}); });
+        promise.get();
     }
 
     ///
@@ -1531,131 +1624,16 @@ namespace anarchofs {
                     detail_close::response_close_request(origin, msg_buffer.data(), message_size);
                     break;
 
+                case Action::FinalizeRequest:
+                    detail_finishing::response_finishing_request(origin, msg_buffer.data(),
+                                                                 message_size);
+                    break;
+
                 default: throw std::runtime_error("unexpected action code"); break;
                 }
                 something_done = true;
             }
 
-            return something_done;
-        }
-    }
-
-    ///
-    /// Client process
-    ///
-
-    namespace detail {
-        /// Return the list of pending requests
-        /// NOTE: not thread-safe, accessed only by the MPI loop thread
-
-        inline std::vector<MPI_Comm> &get_clients() {
-            static std::vector<MPI_Comm> clients;
-            return clients;
-        }
-
-        inline void process_client_action(ClientAction action, const MPI_Comm &comm, int rank,
-                                          const char *buffer, int message_size) {
-            // Process action
-            switch (action) {
-            case ClientAction::GlobalOpenRequest: {
-                // Get path
-                std::string path(buffer, buffer + message_size);
-
-                // Open file
-                get_open_file(path.c_str(), [=](FileId file_id) {
-                    // Return back the file id
-                    auto response_buffer_size = sizeof(FileId);
-                    auto response_buffer = std::shared_ptr<char>(new char[response_buffer_size],
-                                                                 std::default_delete<char[]>());
-                    write_as_chars(file_id, response_buffer.get());
-                    MPI_Request req;
-                    check_mpi(MPI_Isend(response_buffer.get(), response_buffer_size, MPI_CHAR, rank,
-                                        (int)ClientAction::GlobalOpenRequest, comm, &req));
-                    get_pending_mpi_requests().push_back(MPI_RequestBuffer{req, response_buffer});
-                });
-                break;
-            }
-
-            case ClientAction::ReadRequest: {
-                // Read file id
-                FileId file_id = read_from_chars<FileId>(buffer);
-                // Read Offset
-                Offset offset = read_from_chars<Offset>(buffer + sizeof(FileId));
-                // Read size
-                Offset size = read_from_chars<Offset>(buffer + sizeof(FileId) + sizeof(Offset));
-                // Make the read
-                auto read_buffer =
-                    std::shared_ptr<char>(new char[size], std::default_delete<char[]>());
-                read(file_id, offset, size, read_buffer.get(), [=](std::int64_t size_or_error) {
-                    std::size_t response_buffer_size = size;
-                    auto response_buffer = read_buffer;
-                    int tag = (int)ClientAction::ReadRequest;
-                    if (size_or_error < 0) {
-                        // Return the error code only in case of error
-                        response_buffer_size = sizeof(std::int64_t);
-                        response_buffer = std::shared_ptr<char>(new char[response_buffer_size],
-                                                                std::default_delete<char[]>());
-                        write_as_chars(size_or_error, response_buffer.get());
-                        tag = -1;
-                    }
-                    MPI_Request req;
-                    check_mpi(MPI_Isend(response_buffer.get(), response_buffer_size, MPI_CHAR, rank,
-                                        tag, comm, &req));
-                    get_pending_mpi_requests().push_back(MPI_RequestBuffer{req, response_buffer});
-                });
-                break;
-            }
-
-            case ClientAction::CloseRequest: {
-                // Read file id
-                FileId file_id = read_from_chars<FileId>(buffer);
-
-                // Close the file
-                close(file_id, [=](bool success) {
-                    // Return back whether the action was successful
-                    auto response_buffer_size = sizeof(std::uint32_t);
-                    auto response_buffer = std::shared_ptr<char>(new char[response_buffer_size],
-                                                                 std::default_delete<char[]>());
-                    write_as_chars(std::uint32_t(success ? 0 : 1), response_buffer.get());
-                    MPI_Request req;
-                    check_mpi(MPI_Isend(response_buffer.get(), response_buffer_size, MPI_CHAR, rank,
-                                        (int)ClientAction::CloseRequest, comm, &req));
-                    get_pending_mpi_requests().push_back(MPI_RequestBuffer{req, response_buffer});
-                });
-                break;
-            }
-
-            default: throw std::runtime_error("process_client_action: invalid client action");
-            }
-        }
-
-        inline bool process_client_messages() {
-            tracker t_("processing client MPI messages");
-            bool something_done = false;
-            for (const auto comm : get_clients()) {
-                MPI_Message msg;
-                MPI_Status status;
-                int flag;
-                {
-                    tracker t_("processing internal MPI messages (MPI_Iprobe)");
-                    check_mpi(MPI_Improbe(MPI_ANY_SOURCE, MPI_ANY_TAG, comm, &flag, &msg, &status));
-                }
-                if (flag == 0) continue;
-
-                int origin = status.MPI_SOURCE;
-                int message_size;
-                ClientAction action = (ClientAction)status.MPI_TAG;
-                check_mpi(MPI_Get_count(&status, MPI_CHAR, &message_size));
-                static std::vector<char> msg_buffer;
-                if (msg_buffer.size() < (std::size_t)message_size) msg_buffer.resize(message_size);
-                {
-                    tracker t_("processing MPI messages (MPI_Mrecv)");
-                    check_mpi(MPI_Mrecv(msg_buffer.data(), message_size, MPI_CHAR, &msg,
-                                        MPI_STATUS_IGNORE));
-                }
-                process_client_action(action, comm, origin, msg_buffer.data(), message_size);
-                something_done = true;
-            }
             return something_done;
         }
     }
@@ -1680,40 +1658,53 @@ namespace anarchofs {
             return b;
         }
 
-        inline std::string &get_port_name() {
-            static std::string port_name;
-            return port_name;
-        }
-
-        inline void mpi_loop(int *argc, char **argv[]) {
+        inline void mpi_loop(bool within_mpi_app, int *argc, char **argv[]) {
             bool mpi_is_active = false; // whether mpi is initialized
             try {
+                // Initialize MPI (if needed)
+                if (within_mpi_app) {
+                    int thread_level;
+                    check_mpi(MPI_Query_thread(&thread_level));
+                    if (thread_level != MPI_THREAD_MULTIPLE)
+                        throw std::runtime_error("invalid thread level");
+                } else {
+                    //int provided = 0;
+                    //check_mpi(MPI_Init_thread(argc, argv, MPI_THREAD_FUNNELED, &provided));
+                    //if (provided < MPI_THREAD_FUNNELED)
+                    //    throw std::runtime_error("MPI does not support the required thread level");
+                    check_mpi(MPI_Init(argc, argv));
+                }
+
+                // Create a communicator with a single process on each node
+                int nprocs, this_proc;
+                check_mpi(MPI_Comm_rank(MPI_COMM_WORLD, &this_proc));
+                get_proc_id() = this_proc;
+                check_mpi(MPI_Comm_size(MPI_COMM_WORLD, &nprocs));
+                get_num_procs() = nprocs;
                 log("mpi thread is active, baby!\n");
-                // Initialize MPI
-                //int provided = 0;
-                //check_mpi(MPI_Init_thread(argc, argv, MPI_THREAD_FUNNELED, &provided));
-                //if (provided < MPI_THREAD_FUNNELED)
-                //    throw std::runtime_error("MPI does not support the required thread level");
-                check_mpi(MPI_Init(argc, argv));
+                MPI_Comm nodes_comm;
+                check_mpi(MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, this_proc,
+                                              MPI_INFO_NULL, &nodes_comm));
+                int rank_within_node;
+                check_mpi(MPI_Comm_rank(nodes_comm, &rank_within_node));
+                check_mpi(MPI_Comm_free(&nodes_comm));
+                log("mpi rank %d has node rank %d\n", this_proc, rank_within_node);
+
+                std::vector<char> node_leaders(nprocs);
+                char is_this_a_leader = rank_within_node == 0 ? 1 : 0;
+                check_mpi(MPI_Allgather(&is_this_a_leader, 1, MPI_CHAR, node_leaders.data(), 1,
+                                        MPI_CHAR, MPI_COMM_WORLD));
+                for (int rank = 0; rank < nprocs; ++rank) {
+                    if (node_leaders.at(rank) == 1) { get_node_leaders().push_back(rank); }
+                }
+
                 is_mpi_initialized() = true;
                 mpi_is_active = true;
 
-                int nprocs, this_proc;
-                check_mpi(MPI_Comm_rank(MPI_COMM_WORLD, &this_proc));
-                check_mpi(MPI_Comm_size(MPI_COMM_WORLD, &nprocs));
-                log("nprocs= %d\n", nprocs);
-                get_num_procs() = nprocs;
-                get_proc_id() = this_proc;
-
-                // Open a port
-                char port_name[MPI_MAX_PORT_NAME];
-                check_mpi(MPI_Open_port(MPI_INFO_NULL, port_name));
-                get_port_name() = std::string(port_name);
-
-#    ifdef AFS_DAEMON_TRACK_TIME
+#ifdef AFS_DAEMON_TRACK_TIME
                 std::chrono::time_point<std::chrono::system_clock> last_report =
                     std::chrono::system_clock::now();
-#    endif
+#endif
 
                 auto &buffer = get_func_buffer();
                 while (!get_finalize_mpi_thread()) {
@@ -1758,9 +1749,6 @@ namespace anarchofs {
                         something_done = true;
                     }
 
-                    // Process client messages
-                    if (process_client_messages()) something_done = true;
-
                     // Process internal messages
                     if (process_internal_messages()) something_done = true;
 
@@ -1774,17 +1762,18 @@ namespace anarchofs {
                         }
                     }
 
-#    ifdef AFS_DAEMON_TRACK_TIME
+#ifdef AFS_DAEMON_TRACK_TIME
                     const auto now = std::chrono::system_clock::now();
                     if (std::chrono::duration<double>(now - last_report).count() >
                         10 /* 5 mins */) {
                         detail::reportTimings(std::cout);
                         last_report = now;
                     }
-#    endif
+#endif
 
                     if (!something_done) std::this_thread::yield();
                 }
+
             } catch (const std::exception &e) {
                 show_error("Error happened in `anarchofs::mpi_loop`: %s\n", e.what());
             }
@@ -1792,24 +1781,27 @@ namespace anarchofs {
             // Finalize MPI
             log("Finalizing MPI\n");
             if (mpi_is_active) {
-                check_mpi(MPI_Close_port(get_port_name().c_str()));
-                MPI_Finalize();
+                if (!within_mpi_app) check_mpi(MPI_Finalize());
                 is_mpi_initialized() = false;
             }
         }
     }
 
     /// Start the processing messages loop
-    /// \param argc: number of arguments (required by MPI_Init)
-    /// \param argv: list of commandline arguments (required by MPI_Init)
+    /// \param within_mpi_app: whether the invoking application is also invoking other MPI calls
+    /// \param argc: (required by MPI_Init when within_mpi_app is false) number of commandline arguments
+    /// \param argv: (required by MPI_Init when within_mpi_app is false) list of commandline arguemnts
+    ///
+    /// NOTE: if the application is also making MPI calls, then the application is responsible of
+    ///       initializing MPI and with thread level MPI_THREAD_MULTIPLE.
 
-    inline bool start_mpi_loop(int *argc, char **argv[]) {
+    inline bool start_mpi_loop(bool within_mpi_app, int *argc, char **argv[]) {
         using namespace detail;
         log("requesting starting MPI loop\n");
         try {
             is_mpi_initialized() = false;
             get_finalize_mpi_thread() = false;
-            get_mpi_thread() = std::thread([=]() { mpi_loop(argc, argv); });
+            get_mpi_thread() = std::thread([=]() { mpi_loop(within_mpi_app, argc, argv); });
             while (!is_mpi_initialized()) std::this_thread::yield();
             return true;
         } catch (const std::exception &e) {
@@ -1824,6 +1816,7 @@ namespace anarchofs {
         using namespace detail;
         log("requesting stopping MPI loop\n");
         try {
+            finalize();
             get_finalize_mpi_thread() = true;
             get_mpi_thread().join();
             log("MPI loop stopped\n");
@@ -1833,345 +1826,12 @@ namespace anarchofs {
             return false;
         }
     }
-#endif // BUILD_AFS_DAEMON
 
     ///
     /// Client/server imitating a POSIX interface
     ///
 
-    /// Common functions to server and client
-
-    namespace server {
-        namespace detail {
-            enum class SocketAction : int {
-                Connect,
-                /// Package description:
-                /// - request_action:uint32 = Connect
-                ///
-                /// Answer:
-                /// - port_length:uint32
-                /// - port:char[port_length]
-            };
-
-            inline const char *get_socket_path() {
-                const char *l = std::getenv("AFS_SOCKET");
-                if (l) return l;
-                return "/tmp/anarchofs.sock";
-            }
-
-            inline bool read_from_socket(int socket, void *v, std::size_t size) {
-#ifdef BUILD_AFS_DAEMON
-                /// Incorrect, tracker cannot be used outside the MPI thread
-                anarchofs::detail::tracker t_("read_from_socket");
-#endif
-                std::size_t total_read = 0;
-                while (total_read < size) {
-                    ssize_t count =
-                        ::read(socket, (void *)((char *)v + total_read), size - total_read);
-                    if (count <= 0) return false;
-                    total_read += (std::size_t)count;
-                }
-                return true;
-            }
-
-            inline bool write_into_socket(int socket, const void *v, std::size_t size) {
-#ifdef BUILD_AFS_DAEMON
-                /// Incorrect, tracker cannot be used outside the MPI thread
-                anarchofs::detail::tracker t_("write_into_socket");
-#endif
-                std::size_t total_written = 0;
-                while (total_written < size) {
-                    ssize_t count = ::write(socket, (void *)((const char *)v + total_written),
-                                            size - total_written);
-                    if (count <= 0) return false;
-                    total_written += (std::size_t)count;
-                }
-                return true;
-            }
-        }
-    }
-
-#ifdef BUILD_AFS_DAEMON
-    namespace server {
-        namespace detail {
-            /// Return the list of opened file ids associated to a socket
-
-            inline std::unordered_map<int, std::set<FileId>> &get_opened_files_by_sockets() {
-                static std::unordered_map<int, std::set<FileId>> file_ids{16};
-                return file_ids;
-            }
-
-            /// Start tracking opened files by a socket
-
-            inline void start_tracking_files(int socket) {
-                get_opened_files_by_sockets().emplace(std::make_pair(socket, std::set<FileId>{}));
-            }
-
-            /// Close all opened files associated to a socket
-
-            inline void close_all_files(int socket) {
-                for (const auto &file_id : get_opened_files_by_sockets().at(socket))
-                    close(file_id, [=](bool) {});
-                get_opened_files_by_sockets().erase(socket);
-            }
-
-            inline bool process_socket_action(int socket) {
-                using namespace anarchofs::detail;
-
-                // Read the request_action
-                std::uint32_t action_buffer;
-                if (!read_from_socket(socket, &action_buffer, sizeof(action_buffer))) {
-                    warning("process_socket_action: error reading action");
-                    return false;
-                }
-                SocketAction action = (SocketAction)action_buffer;
-
-                // Process action
-                switch (action) {
-                case SocketAction::Connect: {
-                    // Write port
-                    std::vector<char> answer(sizeof(std::uint32_t) + get_port_name().size());
-                    write_as_chars(std::uint32_t(get_port_name().size()), answer.data());
-                    std::copy(get_port_name().begin(), get_port_name().end(),
-                              answer.data() + sizeof(std::uint32_t));
-                    if (!write_into_socket(socket, (const void *)answer.data(), answer.size())) {
-                        warning("process_socket_action: error writing on socket\n");
-                        return false;
-                    }
-                    get_func_buffer().push_back([=]() {
-                        MPI_Comm new_comm;
-                        check_mpi(MPI_Comm_accept(get_port_name().c_str(), MPI_INFO_NULL, 0,
-                                                  MPI_COMM_SELF, &new_comm));
-                        get_clients().push_back(new_comm);
-                    });
-                    break;
-                }
-
-                default: return false;
-                }
-                return true;
-            }
-
-            inline std::thread &get_socket_thread() {
-                static std::thread th;
-                return th;
-            }
-
-            inline bool &get_finalize_socket_thread() {
-                static bool b = false;
-                return b;
-            }
-
-            inline bool &is_socket_initialized() {
-                static bool b = false;
-                return b;
-            }
-
-            inline void socket_loop() {
-                try {
-                    anarchofs::detail::log("socket thread is active, baby!\n");
-
-                    struct sockaddr_un addr;
-                    memset(&addr, 0, sizeof(struct sockaddr_un));
-
-                    // Copy the socket path
-                    const char *socket_path = get_socket_path();
-                    anarchofs::detail::log("server listening to socket %s\n", socket_path);
-                    if (strnlen(socket_path, sizeof(addr.sun_path)) >= sizeof(addr.sun_path))
-                        throw std::runtime_error("socket path is too long");
-                    strcpy(addr.sun_path, socket_path);
-
-                    // Make sure that path isn't being used
-                    if (remove(socket_path) == -1 && errno != ENOENT)
-                        throw std::runtime_error("error removing the socket path");
-
-                    // Create the socket
-                    int socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-                    if (socket_fd == -1) throw std::runtime_error("could not create socket");
-
-                    addr.sun_family = AF_UNIX;
-                    if (bind(socket_fd, (struct sockaddr *)&addr, sizeof(struct sockaddr_un)) == -1)
-                        throw std::runtime_error("could not bind socket");
-
-                    // Set the maximum queue size to 5
-                    if (listen(socket_fd, 5) == -1)
-                        throw std::runtime_error("could not set maximum queue size");
-
-                    // Mark socket as active
-                    is_socket_initialized() = true;
-
-                    std::vector<int> client_sockets;
-                    while (!get_finalize_socket_thread()) {
-                        fd_set readfds;
-
-                        // Clear the socket set
-                        FD_ZERO(&readfds);
-
-                        // Add master socket to set
-                        FD_SET(socket_fd, &readfds);
-                        int max_sd = socket_fd; ///< max socket id
-
-                        // Add child sockets to set
-                        for (const auto &sd : client_sockets) {
-                            //if valid socket descriptor then add to read list
-                            if (sd > 0) FD_SET(sd, &readfds);
-
-                            //highest file descriptor number, need it for the select function
-                            if (sd > max_sd) max_sd = sd;
-                        }
-
-                        // Wait for an activity on one of the sockets, indefinitely
-                        int activity = select(max_sd + 1, &readfds, NULL, NULL, NULL);
-                        if (activity < 0 && errno != EINTR)
-                            throw std::runtime_error("select error");
-
-                        // If something happened on the master socket, then its an incoming connection
-                        if (FD_ISSET(socket_fd, &readfds)) {
-                            int new_socket = accept(socket_fd, NULL, NULL);
-                            if (new_socket < 0) throw std::runtime_error("accept error");
-
-                            // Add new socket to array of sockets
-                            bool added = false;
-                            for (auto &sd : client_sockets) {
-                                if (sd == 0) {
-                                    sd = new_socket;
-                                    added = true;
-                                    break;
-                                }
-                            }
-                            if (!added) client_sockets.push_back(new_socket);
-
-                            // Start tracking the files opened this socket
-                            start_tracking_files(new_socket);
-                        }
-
-                        // Check IO operations on the other sockets
-                        for (auto &sd : client_sockets) {
-                            if (!FD_ISSET(sd, &readfds)) continue;
-
-                            // Check for incoming messages, otherwise assume closing
-                            if (!process_socket_action(sd)) {
-                                close_all_files(sd);
-                                ::close(sd);
-                                sd = 0;
-                            }
-                        }
-                    }
-                } catch (const std::exception &e) {
-                    anarchofs::detail::show_error(
-                        "Error happened in `anarchofs::server::socket_loop`: %s\n", e.what());
-                }
-            }
-        }
-
-        /// Start the processing messages loop
-
-        inline bool start_socket_loop(bool start_new_thread = true) {
-            using namespace detail;
-            anarchofs::detail::log("requesting starting socket loop\n");
-            try {
-                if (start_new_thread) {
-                    is_socket_initialized() = false;
-                    get_finalize_socket_thread() = false;
-                    get_socket_thread() = std::thread([=]() { socket_loop(); });
-                    while (!is_socket_initialized()) std::this_thread::yield();
-                } else {
-                    socket_loop();
-                }
-                return true;
-            } catch (const std::exception &e) {
-                anarchofs::detail::show_error(
-                    "Error happened in `anarchofs::server::start_socket_loop`: %s\n", e.what());
-                return false;
-            }
-        }
-
-        /// Stop the processing messages loop initiated by `start_socket_loop`
-
-        inline bool stop_socket_loop() {
-            using namespace detail;
-            anarchofs::detail::log("requesting stopping socket loop\n");
-            try {
-                get_finalize_socket_thread() = true;
-                get_socket_thread().join();
-                anarchofs::detail::log("socket loop stopped\n");
-                return true;
-            } catch (const std::exception &e) {
-                anarchofs::detail::show_error(
-                    "Error happened in `anarchofs::server::stop_socket_loop`: %s\n", e.what());
-                return false;
-            }
-        }
-    }
-#endif // BUILD_AFS_DAEMON
-
     namespace client {
-
-        namespace detail {
-            inline int get_socket() {
-                static int socket = [=]() {
-                    struct sockaddr_un addr;
-                    memset(&addr, 0, sizeof(struct sockaddr_un));
-
-                    // Copy the socket path
-                    const char *socket_path = server::detail::get_socket_path();
-                    anarchofs::detail::log("client accessing socket %s\n", socket_path);
-                    if (strnlen(socket_path, sizeof(addr.sun_path)) >= sizeof(addr.sun_path))
-                        throw std::runtime_error("socket path is too long");
-                    strcpy(addr.sun_path, socket_path);
-
-                    // Create the socket
-                    int socket_fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
-                    if (socket_fd == -1) throw std::runtime_error("could not create socket");
-
-                    addr.sun_family = AF_UNIX;
-                    if (connect(socket_fd, (struct sockaddr *)&addr, sizeof(struct sockaddr_un)) ==
-                        -1)
-                        throw std::runtime_error("could not bind socket");
-
-                    return socket_fd;
-                }();
-                return socket;
-            }
-
-            inline const MPI_Comm &get_comm() {
-                static MPI_Comm comm = [=]() {
-                    std::uint32_t action = (std::uint32_t)server::detail::SocketAction::Connect;
-                    if (!server::detail::write_into_socket(detail::get_socket(), &action,
-                                                           sizeof(action)))
-                        throw std::runtime_error("error writing in socket");
-                    std::uint32_t port_size = 0;
-                    if (!server::detail::read_from_socket(detail::get_socket(), &port_size,
-                                                          sizeof(port_size)))
-                        throw std::runtime_error("error reading from socket");
-                    std::string port(port_size, (char)0);
-                    if (!server::detail::read_from_socket(detail::get_socket(), &port[0],
-                                                          port_size))
-                        throw std::runtime_error("error reading from socket");
-                    // Make sure that MPI is initialized
-                    int flag;
-                    anarchofs::detail::check_mpi(MPI_Initialized(&flag));
-                    if (flag == 0)
-                        throw std::runtime_error("anarchofs::client::get_comm(): please initialize "
-                                                 "MPI before doing any operation");
-                    MPI_Comm comm;
-                    anarchofs::detail::check_mpi(
-                        MPI_Comm_connect(port.c_str(), MPI_INFO_NULL, 0, MPI_COMM_SELF, &comm));
-                    return comm;
-                }();
-                return comm;
-            }
-
-            inline int get_dest_rank() {
-                int nprocs, this_proc;
-                anarchofs::detail::check_mpi(MPI_Comm_rank(get_comm(), &this_proc));
-                anarchofs::detail::check_mpi(MPI_Comm_size(get_comm(), &nprocs));
-                if (nprocs != 2)
-                    throw std::runtime_error(
-                        "anarchofs::client:get_dest_rank(): error, invalid communicator");
-                return 1 - this_proc;
-            }
-        }
 
         /// File handler
         struct File {
@@ -2184,15 +1844,7 @@ namespace anarchofs {
         /// \return: file handler or (null if failed)
 
         inline File *open(const char *filename) {
-            int filename_size = strlen(filename);
-            anarchofs::detail::check_mpi(MPI_Send(
-                filename, filename_size, MPI_CHAR, detail::get_dest_rank(),
-                (int)anarchofs::detail::ClientAction::GlobalOpenRequest, detail::get_comm()));
-            FileId file_id;
-            anarchofs::detail::check_mpi(
-                MPI_Recv(&file_id, sizeof(file_id), MPI_CHAR, detail::get_dest_rank(),
-                         (int)anarchofs::detail::ClientAction::GlobalOpenRequest,
-                         detail::get_comm(), MPI_STATUS_IGNORE));
+            FileId file_id = anarchofs::get_open_file(filename);
             if (file_id != no_file_id)
                 return new File{file_id, 0};
             else
@@ -2212,38 +1864,8 @@ namespace anarchofs {
         /// \return: number of characters written into the buffer if positive; error code otherwise
 
         inline std::int64_t read(File *f, char *v, std::size_t n) {
-            // Prepare the message
-            std::vector<char> buffer(sizeof(FileId) + sizeof(std::size_t) * 2);
-            anarchofs::detail::write_as_chars(f->file_id, buffer.data());
-            anarchofs::detail::write_as_chars((std::size_t)f->offset,
-                                              buffer.data() + sizeof(FileId));
-            anarchofs::detail::write_as_chars((std::size_t)n,
-                                              buffer.data() + sizeof(FileId) + sizeof(std::size_t));
-            anarchofs::detail::check_mpi(
-                MPI_Send(buffer.data(), buffer.size(), MPI_CHAR, detail::get_dest_rank(),
-                         (int)anarchofs::detail::ClientAction::ReadRequest, detail::get_comm()));
-
-            // Process answer
-            MPI_Message msg;
-            MPI_Status status;
-            anarchofs::detail::check_mpi(MPI_Mprobe(detail::get_dest_rank(), MPI_ANY_TAG,
-                                                    detail::get_comm(), &msg, &status));
-            int message_size;
-            anarchofs::detail::check_mpi(MPI_Get_count(&status, MPI_CHAR, &message_size));
-            if (status.MPI_TAG != (int)anarchofs::detail::ClientAction::ReadRequest &&
-                message_size != sizeof(std::int64_t))
-                throw std::runtime_error("anarchofs::client::read(): error in protocol");
-            std::int64_t error_or_size = message_size;
-            auto buffer_response =
-                status.MPI_TAG == (int)anarchofs::detail::ClientAction::ReadRequest
-                    ? v
-                    : (char *)&error_or_size;
-            anarchofs::detail::check_mpi(
-                MPI_Mrecv(buffer_response, message_size, MPI_CHAR, &msg, MPI_STATUS_IGNORE));
-
-            // Advanced the cursor
+            auto error_or_size = anarchofs::read(f->file_id, f->offset, n, v);
             if (error_or_size > 0) f->offset += error_or_size;
-
             return error_or_size;
         }
 
@@ -2252,19 +1874,9 @@ namespace anarchofs {
         /// \return: whether the operation was successful
 
         inline bool close(File *f) {
-            anarchofs::detail::check_mpi(
-                MPI_Send(&f->file_id, sizeof(f->file_id), MPI_CHAR, detail::get_dest_rank(),
-                         (int)anarchofs::detail::ClientAction::CloseRequest, detail::get_comm()));
-
-            std::uint32_t response = 0;
-            anarchofs::detail::check_mpi(
-                MPI_Recv(&response, sizeof(response), MPI_CHAR, detail::get_dest_rank(),
-                         (int)anarchofs::detail::ClientAction::CloseRequest, detail::get_comm(),
-                         MPI_STATUS_IGNORE));
-
+            bool response = anarchofs::close(f->file_id);
             delete f;
-
-            return response == 0;
+            return response;
         }
     }
 }
