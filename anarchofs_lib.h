@@ -1690,12 +1690,13 @@ namespace anarchofs {
                 check_mpi(MPI_Comm_free(&nodes_comm));
                 log("mpi rank %d has node rank %d\n", this_proc, rank_within_node);
 
-                std::vector<char> node_leaders(nprocs);
-                char is_this_a_leader = rank_within_node == 0 ? 1 : 0;
-                check_mpi(MPI_Allgather(&is_this_a_leader, 1, MPI_CHAR, node_leaders.data(), 1,
-                                        MPI_CHAR, MPI_COMM_WORLD));
+                std::vector<int> ranks_within_node(nprocs);
+                check_mpi(MPI_Allgather(&rank_within_node, 1, MPI_INT, ranks_within_node.data(), 1,
+                                        MPI_INT, MPI_COMM_WORLD));
                 for (int rank = 0; rank < nprocs; ++rank) {
-                    if (node_leaders.at(rank) == 1) { get_node_leaders().push_back(rank); }
+                    if (ranks_within_node.at(rank) == rank_within_node) {
+                        get_node_leaders().push_back(rank);
+                    }
                 }
 
                 is_mpi_initialized() = true;
