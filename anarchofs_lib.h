@@ -165,41 +165,6 @@ namespace anarchofs {
             CHECK_AND_THROW(MPI_ERR_LASTCODE);
 #undef CHECK_AND_THROW
         }
-
-        /// Client actions
-
-        enum class ClientAction : int {
-            GlobalOpenRequest,
-            /// Package description:
-            /// - request_action:int = GlobalOpenRequest (tag)
-            /// - path:char[*]
-            ///
-            /// Answer:
-            /// - file_id::size_t (> 0, or == 0 for error)
-
-            ReadRequest,
-            /// Package description:
-            /// - request_action:int = ReadRequest (tag)
-            /// - request_num:int
-            /// - file_id:uint32
-            /// - offset:size_t
-            /// - size:size_t
-            ///
-            /// Answer if success:
-            /// - request_action:int = ReadRequest (tag)
-            /// - content:char[*]
-            /// Answer if error:
-            /// - request_action:int = -1 (tag)
-            /// - error_code:int64_t
-
-            CloseRequest,
-            /// Package description:
-            /// - request_action:int = CloseRequest (tag)
-            /// - file_id:uint32
-            ///
-            /// Answer:
-            /// - status:uint32 (== 0 for ok, otherwise for error)
-        };
     }
 
     namespace detail {
@@ -1708,7 +1673,7 @@ namespace anarchofs {
 #endif
 
                 auto &buffer = get_func_buffer();
-                while (!get_finalize_mpi_thread()) {
+                while (true) {
                     bool something_done = false;
 
                     // Check pending MPI requests
@@ -1772,7 +1737,10 @@ namespace anarchofs {
                     }
 #endif
 
-                    if (!something_done) std::this_thread::yield();
+                    if (!something_done) {
+                        if (get_finalize_mpi_thread()) break;
+                        std::this_thread::yield();
+                    }
                 }
 
             } catch (const std::exception &e) {
