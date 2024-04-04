@@ -504,9 +504,12 @@ namespace anarchofs {
             /// NOTE: invoked only by MPI loop thread
 
             void set(const T &v) {
-                value = v;
-                done = true;
-                get_talker_condition_variable().notify_one();
+                {
+                    std::lock_guard<std::mutex> guard(get_talker_mutex());
+                    value = v;
+                    done = true;
+                }
+                get_talker_condition_variable().notify_all();
             }
 
             /// Wait and return the value given in function `set`
