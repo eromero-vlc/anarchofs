@@ -438,6 +438,22 @@ namespace anarchofs {
             return proc_id;
         }
 
+        /// Return the number of processes within the node
+        /// Read access by everyone and write access by MPI loop thread
+
+        inline unsigned int &get_num_procs_within_node() {
+            static unsigned int num_procs;
+            return num_procs;
+        }
+
+        /// Return this process id within the node
+        /// Read access by everyone and write access by MPI loop thread
+
+        inline unsigned int &get_proc_id_within_node() {
+            static unsigned int proc_id = -1;
+            return proc_id;
+        }
+
         /// Replace "@NPROC" by the process id in the given string; used for debugging
         /// \param path: given string
 
@@ -919,20 +935,24 @@ namespace anarchofs {
             };
             std::unordered_map<std::string, HandlerAndCount> from_path_to_handler_and_count;
 
-            /// From file id to path
-            /// From file id to file handler
-            struct PathAndHandler {
-                std::string path;
-                FileHandle f;
+            /// Local file info
+            struct PathHandlerAndInfo {
+                std::string path; ///< file path
+                FileHandle f;     ///< file handler
+                Offset offset;    ///< offset to the first byte
+                Offset size;      ///< number of bytes
             };
-            std::unordered_map<FromAndFileId, PathAndHandler, HashForFromAndFileId>
+
+            /// From FileId to local file info
+            std::unordered_map<FromAndFileId, PathHandlerAndInfo, HashForFromAndFileId>
                 from_file_id_to_path_and_handler;
 
             LocalOpenedFiles()
                 : from_path_to_handler_and_count(16), from_file_id_to_path_and_handler(16) {}
 
-            bool open(const char *path, const FromAndFileId &file_id, FileHandle &f) {
+            bool open(const char *path, const FromAndFileId &file_id, Offset &size) {
                 std::string path_s(path);
+                FileHandle f;
                 if (from_path_to_handler_and_count.count(path) == 0) {
                     if (!file_open(path, f)) return false;
                     from_path_to_handler_and_count[path_s] = {f, 1};
@@ -941,13 +961,23 @@ namespace anarchofs {
                     f = handler_and_count.f;
                     handler_and_count.count++;
                 }
-                from_file_id_to_path_and_handler[file_id] = {path_s, f};
+                /// Get file size and split it into the processes within the node
+                Offset file_size = get_file_size(f);
+                size = file_size / get_num_procs_within_node();
+                Offset offset = size * get_proc_id_within_node();
+                if (get_proc_id_within_node() + 1 == get_num_procs_within_node())
+                    size += file_size % get_num_procs_within_node();
+                from_file_id_to_path_and_handler[file_id] = {path_s, f, offset, size};
                 return true;
             }
 
-            bool get_file_handler(const FromAndFileId &file_id, FileHandle &f) {
+            bool get_file_handler(const FromAndFileId &file_id, FileHandle &f, Offset &offset,
+                                  Offset &size) {
                 if (from_file_id_to_path_and_handler.count(file_id) == 0) return false;
-                f = from_file_id_to_path_and_handler.at(file_id).f;
+                const auto &p = from_file_id_to_path_and_handler.at(file_id);
+                f = p.f;
+                offset = p.offset;
+                size = p.size;
                 return true;
             }
 
@@ -1033,11 +1063,11 @@ namespace anarchofs {
 
                 set_request_num(request_num, &response[0]);
 
-                FileHandle f;
-                bool success = get_local_opened_files().open(path_hack.c_str(),
-                                                             FromAndFileId{rank, file_id}, f);
+                Offset file_size = 0;
+                bool success = get_local_opened_files().open(
+                    path_hack.c_str(), FromAndFileId{rank, file_id}, file_size);
                 Offset file_size_plus_one = 0;
-                if (success) file_size_plus_one = get_file_size(f) + 1;
+                if (success) file_size_plus_one = file_size + 1;
                 write_as_chars(file_size_plus_one, &response[sizeof(RequestNum)]);
 
                 MPI_Request req;
@@ -1211,10 +1241,16 @@ namespace anarchofs {
 
                 tracker t0_("read file processing requests (file_read)");
                 FileHandle f;
-                if (!get_local_opened_files().get_file_handler(FromAndFileId{rank, file_id}, f))
+                Offset offset_within_node = 0, max_size = 0;
+                if (!get_local_opened_files().get_file_handler(FromAndFileId{rank, file_id}, f,
+                                                               offset_within_node, max_size))
                     throw std::runtime_error("response_read_request: file_id is not a valid");
+                if (local_size > max_size)
+                    throw std::runtime_error(
+                        "response_read_request: requested size exceeded maximum");
 #ifdef AFS_DAEMON_USE_MPIIO
-                MPI_Request req = file_read(f, local_offset, response_buffer.get(), local_size);
+                MPI_Request req = file_read(f, offset_within_node + local_offset,
+                                            response_buffer.get(), local_size);
                 get_pending_mpi_request_callbacks().push_back(MPI_RequestCallback{
                     req, TickingCallback<QueueCallback::DontQueueCallback>([=]() {
                         tracker t_("read file processing requests (MPI_Isend)");
@@ -1227,7 +1263,7 @@ namespace anarchofs {
                     })});
 
 #else
-                file_read(f, local_offset, response_buffer.get(), local_size);
+                file_read(f, offset_within_node + local_offset, response_buffer.get(), local_size);
                 t0_.stop();
 
                 tracker t1_("read file processing requests (MPI_Isend)");
@@ -1542,7 +1578,7 @@ namespace anarchofs {
                 if (flag == 0) break;
 
                 int origin = status.MPI_SOURCE;
-                Action action = (Action)(status.MPI_TAG % MaxAction);
+                Action action = (Action)status.MPI_TAG;
                 int message_size;
                 check_mpi(MPI_Get_count(&status, MPI_CHAR, &message_size));
                 static std::vector<char> msg_buffer;
@@ -1653,19 +1689,16 @@ namespace anarchofs {
                 MPI_Comm nodes_comm;
                 check_mpi(MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, this_proc,
                                               MPI_INFO_NULL, &nodes_comm));
-                int rank_within_node;
+                int rank_within_node = 0;
+                int nprocs_within_node = 0;
+                check_mpi(MPI_Comm_size(nodes_comm, &nprocs_within_node));
                 check_mpi(MPI_Comm_rank(nodes_comm, &rank_within_node));
                 check_mpi(MPI_Comm_free(&nodes_comm));
                 log("mpi rank %d has node rank %d\n", this_proc, rank_within_node);
+                get_num_procs_within_node() = nprocs_within_node;
+                get_proc_id_within_node() = rank_within_node;
 
-                std::vector<int> ranks_within_node(nprocs);
-                check_mpi(MPI_Allgather(&rank_within_node, 1, MPI_INT, ranks_within_node.data(), 1,
-                                        MPI_INT, MPI_COMM_WORLD));
-                for (int rank = 0; rank < nprocs; ++rank) {
-                    if (ranks_within_node.at(rank) == rank_within_node) {
-                        get_node_leaders().push_back(rank);
-                    }
-                }
+                for (int rank = 0; rank < nprocs; ++rank) get_node_leaders().push_back(rank);
 
                 is_mpi_initialized() = true;
                 mpi_is_active = true;
