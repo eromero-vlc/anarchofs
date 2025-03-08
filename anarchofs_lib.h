@@ -1,3 +1,5 @@
+#ifndef __ANARCHOFS_LIB_H__
+#define __ANARCHOFS_LIB_H__
 /// Proposal for Non-Uniform Storage Access (NUSA): DEMocracy ON IO (DEMONIO)
 /// The following describes a protocol to unionize several filesystems. In general, files and
 /// directories on any of the unionized filesystems will be visible by the other filesystems. And
@@ -1852,3 +1854,4 @@ namespace anarchofs {
         }
     }
 }
+#endif // __ANARCHOFS_LIB_H__
