@@ -416,6 +416,14 @@ namespace anarchofs {
             return requests;
         }
 
+        /// Return the communication used by the library
+        /// Read access by everyone and write access by MPI loop thread
+
+        inline MPI_Comm &get_comm() {
+            static MPI_Comm comm;
+            return comm;
+        }
+
         /// Return the number of processes (one process for each filesystem)
         /// Read access by everyone and write access by MPI loop thread
 
@@ -588,7 +596,7 @@ namespace anarchofs {
 
                 MPI_Request req;
                 check_mpi(MPI_Isend(response, response_buffer_size, MPI_CHAR, rank,
-                                    (int)Action::GetFileStatusAnswer, MPI_COMM_WORLD, &req));
+                                    (int)Action::GetFileStatusAnswer, get_comm(), &req));
                 get_pending_mpi_requests().push_back(MPI_RequestBuffer{req, response_buffer});
             }
 
@@ -653,7 +661,7 @@ namespace anarchofs {
                 MPI_Request req;
                 check_mpi(MPI_Isend(this_msg_pattern_buffer.get(), msg_pattern.size(), MPI_CHAR,
                                     get_node_leaders().at(leader_rank),
-                                    (int)Action::GetFileStatusRequest, MPI_COMM_WORLD, &req));
+                                    (int)Action::GetFileStatusRequest, get_comm(), &req));
                 get_pending_mpi_requests().push_back(
                     MPI_RequestBuffer{req, this_msg_pattern_buffer});
             }
@@ -732,7 +740,7 @@ namespace anarchofs {
                 std::copy(response.begin(), response.end(), response_buffer.get());
                 MPI_Request req;
                 check_mpi(MPI_Isend(response_buffer.get(), response.size(), MPI_CHAR, rank,
-                                    (int)Action::GetDirectoryListAnswer, MPI_COMM_WORLD, &req));
+                                    (int)Action::GetDirectoryListAnswer, get_comm(), &req));
                 get_pending_mpi_requests().push_back(MPI_RequestBuffer{req, response_buffer});
             }
 
@@ -796,7 +804,7 @@ namespace anarchofs {
                 MPI_Request req;
                 check_mpi(MPI_Isend(this_msg_pattern_buffer.get(), msg_pattern.size(), MPI_CHAR,
                                     get_node_leaders().at(leader_rank),
-                                    (int)Action::GetDirectoryListRequest, MPI_COMM_WORLD, &req));
+                                    (int)Action::GetDirectoryListRequest, get_comm(), &req));
                 get_pending_mpi_requests().push_back(
                     MPI_RequestBuffer{req, this_msg_pattern_buffer});
             }
@@ -1044,7 +1052,7 @@ namespace anarchofs {
 
                 MPI_Request req;
                 check_mpi(MPI_Isend(response, response_buffer_size, MPI_CHAR, rank,
-                                    (int)Action::GlobalOpenAnswer, MPI_COMM_WORLD, &req));
+                                    (int)Action::GlobalOpenAnswer, get_comm(), &req));
                 get_pending_mpi_requests().push_back(MPI_RequestBuffer{req, response_buffer});
             }
 
@@ -1111,7 +1119,7 @@ namespace anarchofs {
                 MPI_Request req;
                 check_mpi(MPI_Isend(this_msg_pattern_buffer.get(), msg_pattern.size(), MPI_CHAR,
                                     get_node_leaders().at(leader_rank),
-                                    (int)Action::GlobalOpenRequest, MPI_COMM_WORLD, &req));
+                                    (int)Action::GlobalOpenRequest, get_comm(), &req));
                 get_pending_mpi_requests().push_back(
                     MPI_RequestBuffer{req, this_msg_pattern_buffer});
             }
@@ -1223,7 +1231,7 @@ namespace anarchofs {
                         MPI_Request req;
                         check_mpi(MPI_Isend(response_buffer.get(), local_size, MPI_CHAR, rank,
                                             (int)Action::ReadAnswer + (int)request_num * MaxAction,
-                                            MPI_COMM_WORLD, &req));
+                                            get_comm(), &req));
                         get_pending_mpi_requests().push_back(
                             MPI_RequestBuffer{req, response_buffer});
                     })});
@@ -1236,7 +1244,7 @@ namespace anarchofs {
                 MPI_Request req;
                 check_mpi(MPI_Isend(response_buffer.get(), local_size, MPI_CHAR, rank,
                                     (int)Action::ReadAnswer + (int)request_num * MaxAction,
-                                    MPI_COMM_WORLD, &req));
+                                    get_comm(), &req));
                 get_pending_mpi_requests().push_back(MPI_RequestBuffer{req, response_buffer});
 #endif
             }
@@ -1303,7 +1311,7 @@ namespace anarchofs {
                         buffer + str_offsets[leader_rank], local_counts[leader_rank], MPI_CHAR,
                         get_node_leaders().at(leader_rank),
                         (int)Action::ReadAnswer + MaxAction * next_tag_request_number[leader_rank],
-                        MPI_COMM_WORLD, &req));
+                        get_comm(), &req));
                     get_pending_mpi_request_callbacks().push_back(
                         MPI_RequestCallback{req, callback});
                 }
@@ -1329,7 +1337,7 @@ namespace anarchofs {
                 MPI_Request req;
                 check_mpi(MPI_Isend(this_msg_pattern, this_msg_pattern_size, MPI_CHAR,
                                     get_node_leaders().at(leader_rank), (int)Action::ReadRequest,
-                                    MPI_COMM_WORLD, &req));
+                                    get_comm(), &req));
                 get_pending_mpi_requests().push_back(
                     MPI_RequestBuffer{req, this_msg_pattern_buffer});
                 next_tag_request_number[leader_rank] =
@@ -1426,7 +1434,7 @@ namespace anarchofs {
                 MPI_Request req;
                 check_mpi(MPI_Isend(this_msg_pattern, this_msg_pattern_size, MPI_CHAR,
                                     get_node_leaders().at(leader_rank), (int)Action::CloseRequest,
-                                    MPI_COMM_WORLD, &req));
+                                    get_comm(), &req));
                 get_pending_mpi_requests().push_back(
                     MPI_RequestBuffer{req, this_msg_pattern_buffer});
             }
@@ -1508,7 +1516,7 @@ namespace anarchofs {
             for (unsigned int rank = 0; rank < get_num_procs(); ++rank) {
                 MPI_Request req;
                 check_mpi(MPI_Isend(this_msg_pattern_buffer.get(), 1, MPI_CHAR, rank,
-                                    (int)Action::FinalizeRequest, MPI_COMM_WORLD, &req));
+                                    (int)Action::FinalizeRequest, get_comm(), &req));
                 get_pending_mpi_requests().push_back(
                     MPI_RequestBuffer{req, this_msg_pattern_buffer});
             }
@@ -1538,7 +1546,7 @@ namespace anarchofs {
                 int flag;
                 {
                     tracker t_("processing internal MPI messages (MPI_Iprobe)");
-                    check_mpi(MPI_Improbe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &flag, &msg,
+                    check_mpi(MPI_Improbe(MPI_ANY_SOURCE, MPI_ANY_TAG, get_comm(), &flag, &msg,
                                           &status));
                 }
                 if (flag == 0) break;
@@ -1628,32 +1636,35 @@ namespace anarchofs {
             return b;
         }
 
-        inline void mpi_loop(bool within_mpi_app, int *argc, char **argv[]) {
+        inline void mpi_loop(bool within_mpi_app, int *argc, char **argv[], bool other_mpi_calls) {
             bool mpi_is_active = false; // whether mpi is initialized
             try {
                 // Initialize MPI (if needed)
+                const int required = other_mpi_calls ? MPI_THREAD_MULTIPLE : MPI_THREAD_FUNNELED;
                 if (within_mpi_app) {
                     int thread_level;
                     check_mpi(MPI_Query_thread(&thread_level));
-                    if (thread_level != MPI_THREAD_MULTIPLE)
-                        throw std::runtime_error("invalid thread level");
+                    if (thread_level < required) throw std::runtime_error("invalid thread level");
                 } else {
-                    //int provided = 0;
-                    //check_mpi(MPI_Init_thread(argc, argv, MPI_THREAD_FUNNELED, &provided));
-                    //if (provided < MPI_THREAD_FUNNELED)
-                    //    throw std::runtime_error("MPI does not support the required thread level");
-                    check_mpi(MPI_Init(argc, argv));
+                    int provided = 0;
+                    check_mpi(MPI_Init_thread(argc, argv, required, &provided));
+                    if (provided < required)
+                        throw std::runtime_error("MPI does not support the required thread level");
+                    //check_mpi(MPI_Init(argc, argv));
                 }
+
+                // Create a new global communicator
+                check_mpi(MPI_Comm_dup(MPI_COMM_WORLD, &get_comm()));
 
                 // Create a communicator with a single process on each node
                 int nprocs, this_proc;
-                check_mpi(MPI_Comm_rank(MPI_COMM_WORLD, &this_proc));
+                check_mpi(MPI_Comm_rank(get_comm(), &this_proc));
                 get_proc_id() = this_proc;
-                check_mpi(MPI_Comm_size(MPI_COMM_WORLD, &nprocs));
+                check_mpi(MPI_Comm_size(get_comm(), &nprocs));
                 get_num_procs() = nprocs;
                 log("mpi thread is active, baby!\n");
                 MPI_Comm nodes_comm;
-                check_mpi(MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, this_proc,
+                check_mpi(MPI_Comm_split_type(get_comm(), MPI_COMM_TYPE_SHARED, this_proc,
                                               MPI_INFO_NULL, &nodes_comm));
                 int rank_within_node;
                 check_mpi(MPI_Comm_rank(nodes_comm, &rank_within_node));
@@ -1662,7 +1673,7 @@ namespace anarchofs {
 
                 std::vector<int> ranks_within_node(nprocs);
                 check_mpi(MPI_Allgather(&rank_within_node, 1, MPI_INT, ranks_within_node.data(), 1,
-                                        MPI_INT, MPI_COMM_WORLD));
+                                        MPI_INT, get_comm()));
                 for (int rank = 0; rank < nprocs; ++rank) {
                     if (ranks_within_node.at(rank) == rank_within_node) {
                         get_node_leaders().push_back(rank);
@@ -1755,6 +1766,7 @@ namespace anarchofs {
             // Finalize MPI
             log("Finalizing MPI\n");
             if (mpi_is_active) {
+                check_mpi(MPI_Comm_free(&get_comm()));
                 if (!within_mpi_app) check_mpi(MPI_Finalize());
                 is_mpi_initialized() = false;
             }
@@ -1765,17 +1777,20 @@ namespace anarchofs {
     /// \param within_mpi_app: whether the invoking application is also invoking other MPI calls
     /// \param argc: (required by MPI_Init when within_mpi_app is false) number of commandline arguments
     /// \param argv: (required by MPI_Init when within_mpi_app is false) list of commandline arguemnts
+    /// \param other_mpi_calls: whether the invoking application is also invoking other MPI calls
     ///
     /// NOTE: if the application is also making MPI calls, then the application is responsible of
     ///       initializing MPI and with thread level MPI_THREAD_MULTIPLE.
 
-    inline bool start_mpi_loop(bool within_mpi_app, int *argc, char **argv[]) {
+    inline bool start_mpi_loop(bool within_mpi_app = true, int *argc = nullptr,
+                               char **argv[] = nullptr, bool other_mpi_calls = false) {
         using namespace detail;
         log("requesting starting MPI loop\n");
         try {
             is_mpi_initialized() = false;
             get_finalize_mpi_thread() = false;
-            get_mpi_thread() = std::thread([=]() { mpi_loop(within_mpi_app, argc, argv); });
+            get_mpi_thread() =
+                std::thread([=]() { mpi_loop(within_mpi_app, argc, argv, other_mpi_calls); });
             while (!is_mpi_initialized()) std::this_thread::yield();
             return true;
         } catch (const std::exception &e) {
